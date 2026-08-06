@@ -1,0 +1,3 @@
+# Plaka Tanıma ve Otomatik Bariyer Kontrol Sistemi - Bağımlılıklar
+# Not: Bu dosya ileriki geliştirme aşamalarında doldurulacaktır.
+# Henüz herhangi bir paket eklenmemiştir.

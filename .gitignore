@@ -1,0 +1,41 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Environment Variables
+.env
+
+# Database & Storage
+*.db
+*.sqlite3
+data/*.db
+data/*.sqlite3
+
+# Captured images / Temporary files
+captures/*
+!captures/.gitkeep
+
+# AI Model Files / Weights
+models/*.pt
+models/*.onnx
+models/*.weights
+!models/.gitkeep
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
