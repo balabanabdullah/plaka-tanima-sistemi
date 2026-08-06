@@ -25,6 +25,7 @@ captures/*
 !captures/.gitkeep
 
 # AI Model Files / Weights
+*.pt
 models/*.pt
 models/*.onnx
 models/*.weights
