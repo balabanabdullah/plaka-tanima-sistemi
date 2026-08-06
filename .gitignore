@@ -24,6 +24,10 @@ data/*.sqlite3
 captures/*
 !captures/.gitkeep
 
+# Datasets
+datasets/*
+!datasets/.gitkeep
+
 # AI Model Files / Weights
 *.pt
 models/*.pt
