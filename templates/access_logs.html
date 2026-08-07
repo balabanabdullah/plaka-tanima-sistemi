@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}Erişim Kayıtları | Plaka Sistemi{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+    <h1 class="page-title">Erişim Kayıtları</h1>
+    <span class="page-subtitle">Sistem tarafından kaydedilen son 100 geçiş denemesi</span>
+</div>
+
+<section class="section">
+    {% if logs %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Plaka</th>
+                <th>Yön</th>
+                <th>Karar</th>
+                <th>OCR Güveni</th>
+                <th>Kamera</th>
+                <th>Ret Gerekçesi</th>
+                <th>Tarih / Saat</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>#{{ log.id }}</td>
+                <td><span class="plate-text">{{ log.normalized_plate }}</span></td>
+                <td><span class="text-muted">{{ log.direction }}</span></td>
+                <td>
+                    <span class="badge badge-{{ log.decision.replace('_', '-') }}">
+                        {{ log.decision.upper() }}
+                    </span>
+                </td>
+                <td><span class="text-muted">{{ "%.2f"|format(log.ocr_confidence) }}</span></td>
+                <td><span class="text-muted">{{ log.source_camera }}</span></td>
+                <td><span class="text-muted">{{ log.denial_reason }}</span></td>
+                <td><span class="text-muted">{{ yerel_zaman(log.detected_at) }}</span></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <span class="empty-icon">📜</span>
+        <p>Henüz erişim kaydı bulunmuyor.</p>
+    </div>
+    {% endif %}
+</section>
+
+{% endblock %}

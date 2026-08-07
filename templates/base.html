@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Plaka Tanıma Sistemi{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+    <!-- ── Üst Navbar ── -->
+    <nav class="navbar">
+        <div class="navbar-brand">
+            <span class="brand-icon">🛡</span>
+            <span class="brand-text">Plaka Güvenlik Paneli</span>
+        </div>
+        <div class="navbar-links">
+            <a href="/"            class="nav-link">Dashboard</a>
+            <a href="/pending"     class="nav-link">Pending</a>
+            <a href="/vehicles"    class="nav-link">Araçlar</a>
+            <a href="/access-logs" class="nav-link">Erişim Kayıtları</a>
+        </div>
+    </nav>
+
+    <!-- ── Ana İçerik ── -->
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- ── Alt Bilgi ── -->
+    <footer class="footer">
+        <span>Plaka Tanıma Sistemi &mdash; Yerel Mod &mdash; 127.0.0.1:8000</span>
+    </footer>
+
+</body>
+</html>
