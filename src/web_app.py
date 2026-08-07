@@ -131,11 +131,20 @@ app.mount(
     name="static",
 )
 
-# Jinja2 şablon motoru
+# Jinja2 şablon yöneticisini yapılandır
 templates = Jinja2Templates(directory=str(PROJECT_ROOT / "templates"))
 
-# yerel_zaman fonksiyonunu tüm şablonlara global olarak ekle
+# yerel_zaman fonksiyonunu tüm şablonlara global olarak kaydet
 templates.env.globals["yerel_zaman"] = yerel_zaman
+
+
+@app.get("/health")
+def health_check():
+    """
+    Docker / Kubernetes health check ve canlılık testi endpoint'i.
+    Veritabanına sorgu atmaz, hafif yanıt döner.
+    """
+    return {"status": "ok"}
 
 
 # ─────────────────────────────────────────────
