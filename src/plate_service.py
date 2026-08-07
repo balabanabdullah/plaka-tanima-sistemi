@@ -45,6 +45,28 @@ def normalize_plate(text: str) -> str:
     return text
 
 
+def get_vehicle_by_plate(
+    session: Session,
+    normalized_plate: str,
+) -> Vehicle | None:
+    """
+    normalized_plate ile veritabanından Vehicle kaydını getirir.
+    Sadece okuma yapar: yeni kayıt oluşturmaz, last_seen_at değiştirmez.
+
+    Parametreler:
+        session (Session): Açık veritabanı oturumu.
+        normalized_plate (str): Normalize edilmiş plaka.
+
+    Döndürür:
+        Vehicle | None: Bulunan araç nesnesi veya None.
+    """
+    return (
+        session.query(Vehicle)
+        .filter_by(normalized_plate=normalized_plate)
+        .first()
+    )
+
+
 # ─────────────────────────────────────────────
 # Araç Kayıt Yönetimi
 # ─────────────────────────────────────────────
@@ -335,3 +357,35 @@ def deactivate_vehicle(
     arac.status = VehicleStatus.inactive
     arac.updated_at = utc_now()
     return arac
+
+
+def delete_vehicle(
+    session: Session,
+    normalized_plate: str,
+) -> None:
+    """
+    normalized_plate ile belirtilen aracı veritabanından kalıcı olarak siler.
+    Geçmiş erişim kayıtlarının (access_logs) silinmemesi için
+    ilgili logların vehicle_id alanı None olarak güncellenir.
+
+    Parametreler:
+        session:          Açık veritabanı oturumu.
+        normalized_plate: Silinecek aracın normalize edilmiş plakası.
+
+    Hatalar:
+        ValueError: Araç bulunamazsa üretilir.
+    """
+    arac = (
+        session.query(Vehicle)
+        .filter_by(normalized_plate=normalized_plate)
+        .first()
+    )
+    if arac is None:
+        raise ValueError(f"Araç bulunamadı: {normalized_plate!r}")
+
+    # Geçmiş erişim kayıtlarının bozulmaması için vehicle_id bağını kopar
+    session.query(AccessLog).filter_by(vehicle_id=arac.id).update({"vehicle_id": None})
+
+    # Araç ana kaydını sil
+    session.delete(arac)
+

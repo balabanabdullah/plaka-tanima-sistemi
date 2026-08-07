@@ -1,0 +1,371 @@
+/* ==========================================================================
+   Plaka Tanıma Sistemi - Güvenlik Paneli Stil Dosyası (style.css)
+   ========================================================================== */
+
+:root {
+    --bg-main: #0f172a;
+    --bg-card: #1e293b;
+    --bg-hover: #334155;
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --border-color: #334155;
+    
+    --color-pending: #f59e0b;
+    --color-approved: #10b981;
+    --color-rejected: #ef4444;
+    --color-inactive: #64748b;
+    --color-allow: #10b981;
+    --color-wait: #f59e0b;
+    --color-deny: #ef4444;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    line-height: 1.5;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Navbar */
+.navbar {
+    background-color: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    padding: 0.85rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #38bdf8;
+}
+
+.navbar-links {
+    display: flex;
+    gap: 1rem;
+}
+
+.nav-link {
+    color: var(--text-secondary);
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    font-weight: 500;
+    font-size: 0.95rem;
+    transition: all 0.2s ease;
+}
+
+.nav-link:hover {
+    color: var(--text-primary);
+    background-color: var(--bg-hover);
+}
+
+/* Main Container */
+.container {
+    max-width: 1200px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+    flex: 1;
+}
+
+.page-header {
+    margin-bottom: 1.5rem;
+}
+
+.page-title {
+    font-size: 1.75rem;
+    font-weight: 700;
+}
+
+.page-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+/* Sayaç Kartları Grid */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.25rem;
+    margin-bottom: 2rem;
+}
+
+.stat-card {
+    background-color: var(--bg-card);
+    border-radius: 8px;
+    padding: 1.25rem;
+    border-left: 4px solid var(--border-color);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.stat-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.stat-link {
+    text-decoration: none;
+    color: inherit;
+    display: block;
+}
+
+.stat-number {
+    font-size: 2.2rem;
+    font-weight: 800;
+    line-height: 1;
+    margin-bottom: 0.35rem;
+}
+
+.stat-label {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.stat-pending { border-left-color: var(--color-pending); }
+.stat-pending .stat-number { color: var(--color-pending); }
+
+.stat-approved { border-left-color: var(--color-approved); }
+.stat-approved .stat-number { color: var(--color-approved); }
+
+.stat-rejected { border-left-color: var(--color-rejected); }
+.stat-rejected .stat-number { color: var(--color-rejected); }
+
+.stat-inactive { border-left-color: var(--color-inactive); }
+.stat-inactive .stat-number { color: var(--color-inactive); }
+
+/* Filtre Çubuğu */
+.filter-bar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+}
+
+.filter-btn {
+    text-decoration: none;
+    color: var(--text-secondary);
+    background-color: var(--bg-card);
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    border: 1px solid var(--border-color);
+    transition: all 0.2s ease;
+}
+
+.filter-btn:hover, .filter-btn.active {
+    color: var(--text-primary);
+    background-color: var(--bg-hover);
+    border-color: #38bdf8;
+}
+
+/* Bölümler ve Tablolar */
+.section {
+    background-color: var(--bg-card);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    padding: 1.25rem;
+    margin-bottom: 2rem;
+}
+
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.section-title {
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+
+.section-link {
+    color: #38bdf8;
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.section-link:hover {
+    text-decoration: underline;
+}
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+    font-size: 0.9rem;
+}
+
+.data-table th, .data-table td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.data-table th {
+    color: var(--text-secondary);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+}
+
+.data-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.data-table tbody tr:hover {
+    background-color: rgba(255, 255, 255, 0.02);
+}
+
+.plate-text {
+    font-family: monospace;
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: 1px;
+    background-color: #0f172a;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #334155;
+    color: #facc15;
+}
+
+.text-muted {
+    color: var(--text-secondary);
+}
+
+/* Durum Badge'leri */
+.badge {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.badge-pending, .badge-wait-for-approval {
+    background-color: rgba(245, 158, 11, 0.15);
+    color: var(--color-pending);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.badge-approved, .badge-allow {
+    background-color: rgba(16, 185, 129, 0.15);
+    color: var(--color-approved);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.badge-rejected, .badge-deny {
+    background-color: rgba(239, 68, 68, 0.15);
+    color: var(--color-rejected);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.badge-inactive {
+    background-color: rgba(100, 116, 139, 0.15);
+    color: var(--color-inactive);
+    border: 1px solid rgba(100, 116, 139, 0.3);
+}
+
+/* Butonlar ve Formlar */
+.action-cell {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.inline-form {
+    display: inline-flex;
+    gap: 0.35rem;
+}
+
+.btn {
+    border: none;
+    padding: 0.4rem 0.75rem;
+    border-radius: 5px;
+    font-weight: 600;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: opacity 0.2s ease;
+}
+
+.btn:hover {
+    opacity: 0.85;
+}
+
+.btn-approve {
+    background-color: var(--color-approved);
+    color: #022c22;
+}
+
+.btn-reject {
+    background-color: var(--color-rejected);
+    color: #450a0a;
+}
+
+.btn-delete {
+    background-color: #475569;
+    color: #f8fafc;
+}
+
+.btn-delete:hover {
+    background-color: #dc2626;
+    color: #ffffff;
+}
+
+.reason-input {
+    background-color: var(--bg-main);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 0.35rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    width: 140px;
+}
+
+.reason-input:focus {
+    outline: 1px solid #38bdf8;
+}
+
+/* Boş Durum */
+.empty-state {
+    text-align: center;
+    padding: 2.5rem 1rem;
+    color: var(--text-secondary);
+}
+
+.empty-icon {
+    font-size: 2rem;
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
+/* Footer */
+.footer {
+    text-align: center;
+    padding: 1.25rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    border-top: 1px solid var(--border-color);
+    background-color: var(--bg-card);
+}

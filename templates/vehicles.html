@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} | Plaka Sistemi{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+    <h1 class="page-title">{{ title }}</h1>
+    <span class="page-subtitle">Sistemdeki araçların yetki ve durum yönetimi</span>
+</div>
+
+<!-- ── Status Filtre Linkleri ── -->
+<div class="filter-bar">
+    <a href="/vehicles" class="filter-btn {% if not current_status and not pending_mode %}active{% endif %}">Tümü</a>
+    <a href="/pending" class="filter-btn {% if pending_mode or current_status == 'pending' %}active{% endif %}">⏳ Pending</a>
+    <a href="/vehicles?status=approved" class="filter-btn {% if current_status == 'approved' and not pending_mode %}active{% endif %}">✅ Approved</a>
+    <a href="/vehicles?status=rejected" class="filter-btn {% if current_status == 'rejected' and not pending_mode %}active{% endif %}">❌ Rejected</a>
+    <a href="/vehicles?status=inactive" class="filter-btn {% if current_status == 'inactive' and not pending_mode %}active{% endif %}">🔒 Inactive</a>
+</div>
+
+<!-- ── Araçlar Tablosu ── -->
+<section class="section">
+    {% if vehicles %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Plaka</th>
+                <th>Durum</th>
+                <th>İlk Görülme</th>
+                <th>Son Görülme</th>
+                <th>Onay Zamanı</th>
+                <th>Onaylayan</th>
+                {% if pending_mode or current_status == 'pending' or not current_status %}
+                <th>İşlem</th>
+                {% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for v in vehicles %}
+            <tr>
+                <td>#{{ v.id }}</td>
+                <td><span class="plate-text">{{ v.normalized_plate }}</span></td>
+                <td>
+                    <span class="badge badge-{{ v.status }}">
+                        {{ v.status.upper() }}
+                    </span>
+                </td>
+                <td class="text-muted">{{ yerel_zaman(v.first_seen_at) }}</td>
+                <td class="text-muted">{{ yerel_zaman(v.last_seen_at) }}</td>
+                <td class="text-muted">{{ yerel_zaman(v.approved_at) }}</td>
+                <td class="text-muted">{{ v.approved_by or '-' }}</td>
+                
+                <td class="action-cell">
+                    {% if v.status == 'pending' %}
+                    <form method="post" action="/vehicles/{{ v.id }}/approve" class="inline-form">
+                        <button type="submit" class="btn btn-approve">Onayla</button>
+                    </form>
+                    <form method="post" action="/vehicles/{{ v.id }}/reject" class="inline-form">
+                        <input type="text" name="reason" placeholder="Gerekçe" class="reason-input">
+                        <button type="submit" class="btn btn-reject">Reddet</button>
+                    </form>
+                    {% endif %}
+                    <form method="post" action="/vehicles/{{ v.id }}/delete" class="inline-form">
+                        <button type="submit" class="btn btn-delete" title="Kalıcı olarak siler (geçmiş loglar korunur)">Sil</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <span class="empty-icon">🚗</span>
+        <p>Gösterilecek araç kaydı bulunamadı.</p>
+    </div>
+    {% endif %}
+</section>
+
+{% endblock %}

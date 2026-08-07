@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard | Plaka Sistemi{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+    <h1 class="page-title">Dashboard</h1>
+    <span class="page-subtitle">Sistem durumu ve son etkinlikler</span>
+</div>
+
+<!-- ── Durum Sayaç Kartları ── -->
+<div class="stats-grid">
+
+    <div class="stat-card stat-pending">
+        <a href="/pending" class="stat-link">
+            <div class="stat-number">{{ stats.pending }}</div>
+            <div class="stat-label">⏳ Onay Bekleyen</div>
+        </a>
+    </div>
+
+    <div class="stat-card stat-approved">
+        <a href="/vehicles?status=approved" class="stat-link">
+            <div class="stat-number">{{ stats.approved }}</div>
+            <div class="stat-label">✅ Onaylı</div>
+        </a>
+    </div>
+
+    <div class="stat-card stat-rejected">
+        <a href="/vehicles?status=rejected" class="stat-link">
+            <div class="stat-number">{{ stats.rejected }}</div>
+            <div class="stat-label">❌ Reddedilmiş</div>
+        </a>
+    </div>
+
+    <div class="stat-card stat-inactive">
+        <a href="/vehicles?status=inactive" class="stat-link">
+            <div class="stat-number">{{ stats.inactive }}</div>
+            <div class="stat-label">🔒 Pasif</div>
+        </a>
+    </div>
+
+</div>
+
+<!-- ── Pending Araçlar (ilk 5) ── -->
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">⏳ Onay Bekleyen Araçlar</h2>
+        <a href="/pending" class="section-link">Tümünü Gör →</a>
+    </div>
+
+    {% if pending_vehicles %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Plaka</th>
+                <th>İlk Görülme</th>
+                <th>Son Görülme</th>
+                <th>İşlem</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for v in pending_vehicles %}
+            <tr>
+                <td><span class="plate-text">{{ v.normalized_plate }}</span></td>
+                <td class="text-muted">{{ yerel_zaman(v.first_seen_at) }}</td>
+                <td class="text-muted">{{ yerel_zaman(v.last_seen_at) }}</td>
+                <td class="action-cell">
+                    <form method="post" action="/vehicles/{{ v.id }}/approve" class="inline-form">
+                        <button type="submit" class="btn btn-approve">Onayla</button>
+                    </form>
+                    <form method="post" action="/vehicles/{{ v.id }}/reject" class="inline-form">
+                        <input type="text" name="reason" placeholder="Gerekçe (opsiyonel)" class="reason-input">
+                        <button type="submit" class="btn btn-reject">Reddet</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <span class="empty-icon">✅</span>
+        <p>Onay bekleyen araç yok.</p>
+    </div>
+    {% endif %}
+</section>
+
+<!-- ── Son Erişim Kayıtları ── -->
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">📋 Son Erişim Kayıtları</h2>
+        <a href="/access-logs" class="section-link">Tümünü Gör →</a>
+    </div>
+
+    {% if recent_logs %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Plaka</th>
+                <th>Karar</th>
+                <th>Yön</th>
+                <th>OCR Güveni</th>
+                <th>Zaman</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for log in recent_logs %}
+            <tr>
+                <td><span class="plate-text">{{ log.normalized_plate }}</span></td>
+                <td>
+                    <span class="badge badge-{{ log.decision.replace('_', '-') }}">
+                        {{ log.decision.upper() }}
+                    </span>
+                </td>
+                <td class="text-muted">{{ log.direction }}</td>
+                <td class="text-muted">{{ "%.2f"|format(log.ocr_confidence) }}</td>
+                <td class="text-muted">{{ yerel_zaman(log.detected_at) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <span class="empty-icon">📋</span>
+        <p>Henüz erişim kaydı yok.</p>
+    </div>
+    {% endif %}
+</section>
+
+{% endblock %}

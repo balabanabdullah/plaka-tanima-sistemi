@@ -1,5 +1,6 @@
 import re
 import cv2
+import time
 import numpy
 from pathlib import Path
 from collections import deque, Counter
@@ -18,6 +19,7 @@ from database import init_db, get_session
 from plate_service import (
     normalize_plate,
     get_or_create_vehicle,
+    get_vehicle_by_plate,
     evaluate_access,
     create_access_log,
     should_log,
@@ -33,13 +35,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "license_plate_detector.pt"
 
 # OCR güven eşiği: bu değerin altındaki okumalar geçersiz sayılır
-OCR_CONFIDENCE_THRESHOLD = 0.30
+OCR_CONFIDENCE_THRESHOLD = 0.45
 
 # OCR kaç karede bir çalışacak (CPU yükünü azaltmak için)
-OCR_FRAME_INTERVAL = 5
+OCR_FRAME_INTERVAL = 8
+
+# Veritabanı durum yenileme sıklığı (saniye)
+DB_STATUS_REFRESH_SECONDS = 1.0
+
+# Yeni plaka adayı doğrulama tekrar sayısı
+NEW_PLATE_CONFIRMATIONS = 3
 
 # OCR için izin verilen karakter listesi (yalnızca Latin harf ve rakam)
 OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+# Minimum plaka kutusu boyutları (piksel)
+MIN_PLATE_WIDTH = 120
+MIN_PLATE_HEIGHT = 35
+
+# Minimum keskinlik eşiği (Laplacian varyansı)
+MIN_SHARPNESS = 60.0
+
+# Hata ayıklama / Debug modu
+DEBUG_OCR = False
 
 # Kararlılık geçmişi: son kaç OCR sonucu saklanacak
 OCR_HISTORY_SIZE = 10
@@ -159,6 +177,9 @@ def read_plate_text(reader: "easyocr.Reader", plate_crop: numpy.ndarray) -> tupl
     Döndürür:
         tuple[str, float]: (okunan metin, ortalama güven değeri)
     """
+    if plate_crop is None or plate_crop.size == 0:
+        return "OKUNAMADI", 0.0
+
     try:
         # EasyOCR ile metin tespit et; yalnızca izin verilen karakterleri kullan
         results = reader.readtext(plate_crop, allowlist=OCR_ALLOWLIST)
@@ -344,6 +365,35 @@ def process_plate_access(
         return None
 
 
+def refresh_plate_access_status(plate_text: str) -> "tuple[str, str] | None":
+    """
+    Görüntüdeki kararlı plakanın veritabanındaki güncel yetki durumunu (status)
+    ve geçiş kararını (decision) salt okunur olarak sorgular.
+    Herhangi bir access_log kaydı OLUŞTURMAZ, last_seen_at GÜNCELLEMEZ.
+
+    Parametreler:
+        plate_text (str): Kararlı plaka metni
+
+    Döndürür:
+        tuple[str, str] | None: (status_str, decision_str) veya None
+    """
+    try:
+        normalized = normalize_plate(plate_text)
+    except ValueError:
+        return None
+
+    try:
+        with get_session() as session:
+            vehicle = get_vehicle_by_plate(session, normalized)
+            if vehicle is None:
+                return None
+            decision = evaluate_access(vehicle)
+            return vehicle.status.value, decision.value
+    except Exception as e:
+        print(f"Uyarı: Status refresh sırasında sorun oluştu: {e}")
+        return None
+
+
 def run_plate_ocr(camera_source: int = 0) -> None:
     """
     Kameradan canlı görüntü alır, YOLO ile plaka tespiti yapar,
@@ -390,6 +440,12 @@ def run_plate_ocr(camera_source: int = 0) -> None:
     # Veritabanı entegrasyonu için durum değişkenleri
     son_veritabani_metin = ""    # DB'ye en son gönderilen kararlı plaka metni
     son_db_durum = ""            # Ekranda gösterilecek araç durumu (PENDING, APPROVED, vb.)
+    son_db_karar = ""            # Ekranda gösterilecek geçiş kararı (ALLOW, WAIT, DENY)
+    son_refresh_zamani = 0.0     # Son DB status refresh yapılma zamanı (time.monotonic)
+
+    # Yeni plaka adayı takibi (eski plakadan hızlı geçiş için)
+    aday_metin = ""
+    aday_tekrar = 0
 
     # OCR geçmişi: son OCR_HISTORY_SIZE adet (metin, güven) çiftini saklar
     # deque, sınıra ulaşınca en eski kaydı otomatik siler
@@ -412,6 +468,32 @@ def run_plate_ocr(camera_source: int = 0) -> None:
             h_frame, w_frame = frame.shape[:2]
             kare_sayaci += 1
 
+            # Periyodik DB Status Refresh: Kararlı plaka ekranda dururken web panelden yapılan
+            # approve/reject/delete gibi değişiklikleri anlık olarak kontrol et (1 saniyede bir)
+            simdi_mono = time.monotonic()
+            if son_veritabani_metin and (simdi_mono - son_refresh_zamani >= DB_STATUS_REFRESH_SECONDS):
+                guncel_sonuc = refresh_plate_access_status(son_veritabani_metin)
+                if guncel_sonuc is not None:
+                    yeni_durum, yeni_karar = guncel_sonuc
+                    yeni_durum_up = yeni_durum.upper()
+                    yeni_karar_up = yeni_karar.upper()
+
+                    # Durum veya karar değiştiyse ekrana yansıt
+                    if yeni_durum_up != son_db_durum or yeni_karar_up != son_db_karar:
+                        print(f"[STATUS GÜNCELLENDİ] Plaka: {son_veritabani_metin} | Durum: {yeni_durum_up} | Karar: {yeni_karar_up}")
+                        son_db_durum = yeni_durum_up
+                        son_db_karar = yeni_karar_up
+                else:
+                    # Web panelden araç silinmiş: DB durumu ve kaydını temizle
+                    # Araç tekrar okunduğunda yeni araç gibi (pending) işlenecektir
+                    if DEBUG_OCR:
+                        print(f"[STATUS GÜNCELLENDİ] Araç silindi: {son_veritabani_metin}")
+                    son_db_durum = ""
+                    son_db_karar = ""
+                    son_veritabani_metin = ""
+
+                son_refresh_zamani = simdi_mono
+
             # 3. YOLO ile plaka tespiti yap
             results = yolo_model(frame, conf=0.40, verbose=False, device="cpu")
             kutular = results[0].boxes
@@ -429,22 +511,74 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                # 5. Her 5 karede bir OCR çalıştır
+                # 5. Belirlenen kare aralığında (OCR_FRAME_INTERVAL) OCR çalıştır
                 if kare_sayaci % OCR_FRAME_INTERVAL == 0:
+                    crop_w = x2 - x1
+                    crop_h = y2 - y1
+
+                    # Minimum boyut kontrolü: çok küçük plaka kutularında OCR çalıştırma
+                    if crop_w < MIN_PLATE_WIDTH or crop_h < MIN_PLATE_HEIGHT:
+                        if DEBUG_OCR:
+                            print(f"[DEBUG OCR] Boyut yetersiz atlandı: {crop_w}x{crop_h} (Min: {MIN_PLATE_WIDTH}x{MIN_PLATE_HEIGHT})")
+                        continue
+
                     plate_crop = frame[y1:y2, x1:x2]
+
+                    # Keskinlik (sharpness) kontrolü: Laplacian varyansı
+                    gray_crop = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                    sharpness = float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
+
+                    if sharpness < MIN_SHARPNESS:
+                        if DEBUG_OCR:
+                            print(f"[DEBUG OCR] Bulanık plaka atlandı: Sharpness={sharpness:.1f} (Min: {MIN_SHARPNESS})")
+                        continue
+
                     islenmis = preprocess_plate(plate_crop)
                     okunan, guven = read_plate_text(ocr_reader, islenmis)
 
+                    if DEBUG_OCR:
+                        print(f"[DEBUG OCR] Boyut: {crop_w}x{crop_h} | Keskinlik: {sharpness:.1f} | OCR: '{okunan}' | Güven: {guven}")
+
                     if okunan != "OKUNAMADI":
+                        # Yeni plaka adayı takibi:
+                        # Mevcut kararlı bir veritabanı plakası varken farklı ve geçerli bir plaka okunursa:
+                        if son_veritabani_metin and okunan != son_veritabani_metin:
+                            if okunan == aday_metin:
+                                aday_tekrar += 1
+                            else:
+                                aday_metin = okunan
+                                aday_tekrar = 1
+
+                            # Farklı aday NEW_PLATE_CONFIRMATIONS kadar doğrulandıysa yeni araca geç!
+                            if aday_tekrar >= NEW_PLATE_CONFIRMATIONS:
+                                if DEBUG_OCR:
+                                    print(f"[YENİ PLAKA ALGILANDI] Eski: {son_veritabani_metin} -> Yeni Aday: {aday_metin}")
+
+                                # Tüm eski state'i temizle, yeni plakaya temiz başlangıç sağla
+                                ocr_gecmisi.clear()
+                                basarisiz_sayisi = 0
+                                en_iyi_metin = "OKUNAMADI"
+                                en_iyi_guven = 0.0
+                                son_metin = "OKUNUYOR..."
+                                son_guven = 0.0
+                                son_yazdirilan_metin = ""
+                                son_veritabani_metin = ""
+                                son_db_durum = ""
+                                son_db_karar = ""
+                                son_refresh_zamani = 0.0
+                                aday_metin = ""
+                                aday_tekrar = 0
+                        else:
+                            # Okunan plaka mevcut kararlı plaka ile aynı ise aday takibini sıfırla
+                            aday_metin = ""
+                            aday_tekrar = 0
+
                         # Başarılı okuma: geçmişe ekle, başarısız sayacını sıfırla
                         ocr_gecmisi.append((okunan, guven))
                         basarisiz_sayisi = 0
 
                         # En iyi sonucu güncelle:
                         # Yalnızca yeni güven mevcut en iyi güvenden 0.02 daha yüksekse kabul et
-                        # Bu kural, 34FRK052 0.95 gibi iyi bir sonucun
-                        # B4FRK052 0.67 gibi düşük güvenli bir okuma tarafından
-                        # ezilmesini engeller
                         if guven >= en_iyi_guven + 0.02:
                             en_iyi_metin = okunan
                             en_iyi_guven = guven
@@ -467,6 +601,10 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                         son_yazdirilan_metin = ""
                         son_veritabani_metin = ""
                         son_db_durum = ""
+                        son_db_karar = ""
+                        son_refresh_zamani = 0.0
+                        aday_metin = ""
+                        aday_tekrar = 0
 
                     # 6. Geçmişteki metinleri say ve kararlı sonucu belirle
                     if len(ocr_gecmisi) > 0:
@@ -514,6 +652,8 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                                     norm, durum, karar = db_sonuc
                                     son_veritabani_metin = gosterilecek_metin
                                     son_db_durum = durum.upper()
+                                    son_db_karar = karar.upper()
+                                    son_refresh_zamani = time.monotonic()
                                     # Yapılandırılmış terminal çıktısı
                                     print("-" * 40)
                                     print(f"Plaka       : {norm}")
@@ -525,19 +665,37 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                 # 6. Plaka kutusunu çiz
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                # 7. OCR sonucunu ve DB durumunu kutunun üzerine yaz
-                # DB işlemi başarılıysa: "34FRK052 | APPROVED"
-                # DB işlemi henüz yapılmadıysa: "OKUNUYOR..."
+                # 7. OCR sonucunu, DB durumunu ve geçiş kararını kutunun üzerine yaz
+                # DB işlemi başarılıysa 2 satır olarak gösterilir:
+                #   Satır 1: "34FRK052 | APPROVED"
+                #   Satır 2: "ALLOW"
                 if son_db_durum:
-                    etiket = f"{son_metin} | {son_db_durum}"
+                    karar_etiket = "WAIT" if "WAIT" in son_db_karar else son_db_karar
+                    etiket1 = f"{son_metin} | {son_db_durum}"
+                    etiket2 = f"{karar_etiket}"
+
+                    # Satır 1: Plaka | DURUM (Yeşil)
+                    cv2.putText(
+                        frame, etiket1,
+                        (x1, max(y1 - 24, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2
+                    )
+                    # Satır 2: KARAR (Sarı)
+                    cv2.putText(
+                        frame, etiket2,
+                        (x1, max(y1 - 6, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 255), 2
+                    )
                 else:
                     etiket = son_metin
-                cv2.putText(
-                    frame, etiket,
-                    (x1, max(y1 - 8, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0), 2
-                )
+                    cv2.putText(
+                        frame, etiket,
+                        (x1, max(y1 - 8, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2
+                    )
 
             # 8. Görüntüyü ekranda göster
             cv2.imshow("Plaka Tanima Sistemi - YOLO ve OCR", frame)
