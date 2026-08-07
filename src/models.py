@@ -1,10 +1,10 @@
 import enum
+import uuid
 from datetime import datetime, timezone
 from typing import Optional, List
 
 from sqlalchemy import String, Float, DateTime, ForeignKey, Enum as SAEnum, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-
 
 # ─────────────────────────────────────────────
 # Yardımcı: UTC zaman üretimi
@@ -88,6 +88,11 @@ class Vehicle(Base):
     # Birincil anahtar
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
+    # Benzersiz senkronizasyon kimliği (UUID)
+    sync_id: Mapped[Optional[str]] = mapped_column(
+        String(36), unique=True, index=True, nullable=True, default=lambda: str(uuid.uuid4())
+    )
+
     # OCR'dan gelen ham plaka metni (örn: "34 ABC 123")
     plate_text: Mapped[str] = mapped_column(String, nullable=False)
 
@@ -152,6 +157,11 @@ class AccessLog(Base):
 
     # Birincil anahtar
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Benzersiz senkronizasyon kimliği (UUID)
+    sync_id: Mapped[Optional[str]] = mapped_column(
+        String(36), unique=True, index=True, nullable=True, default=lambda: str(uuid.uuid4())
+    )
 
     # Bağlı araç kaydı (None: plaka henüz tanımlanamadı)
     vehicle_id: Mapped[Optional[int]] = mapped_column(

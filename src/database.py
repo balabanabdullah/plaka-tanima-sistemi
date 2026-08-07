@@ -103,9 +103,28 @@ engine = _engine
 SessionLocal = _SessionLocal
 
 
-# ─────────────────────────────────────────────
-# Veritabanını Başlatma
-# ─────────────────────────────────────────────
+def _ensure_schema_upgrades(eng) -> None:
+    """
+    Mevcut SQLite veritabanı dosyalarında sync_id sütunu yoksa tahribatsız (non-destructive) olarak ekler.
+    Mevcut yerel verileri korur.
+    """
+    from sqlalchemy import text
+    try:
+        with eng.connect() as conn:
+            try:
+                conn.execute(text("ALTER TABLE vehicles ADD COLUMN sync_id VARCHAR(36);"))
+                conn.commit()
+            except Exception:
+                pass
+
+            try:
+                conn.execute(text("ALTER TABLE access_logs ADD COLUMN sync_id VARCHAR(36);"))
+                conn.commit()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def init_db() -> None:
     """
@@ -127,6 +146,7 @@ def init_db() -> None:
 
     eng = get_engine()
     Base.metadata.create_all(bind=eng)
+    _ensure_schema_upgrades(eng)
     sanitized_url = sanitize_db_url(url)
     print(f"Veritabanı hazır: {sanitized_url}")
 
