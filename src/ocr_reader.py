@@ -12,6 +12,19 @@ except ImportError:
 
 from ultralytics import YOLO
 
+# Veritabanı ve servis katmanı
+# Bu modüller src/ altında bulunur; python src/ocr_reader.py ile çalıştırılır
+from database import init_db, get_session
+from plate_service import (
+    normalize_plate,
+    get_or_create_vehicle,
+    evaluate_access,
+    create_access_log,
+    should_log,
+)
+from models import AccessDirection
+from sqlalchemy.exc import SQLAlchemyError
+
 # Proje kök dizini ve varsayılan model yolu
 # Path(__file__) -> bu dosyanın konumu (src/ocr_reader.py)
 # .parent -> src/ klasörü
@@ -266,15 +279,89 @@ def normalize_plate_text(text: str) -> str:
     return text
 
 
+def process_plate_access(
+    plate_text: str,
+    ocr_confidence: float,
+    direction: AccessDirection = AccessDirection.unknown,
+    source_camera: str = "cam_0",
+) -> "tuple[str, str, str] | None":
+    """
+    Kararlı OCR metnini veritabanına kaydeder ve erişim kararı üretir.
+
+    Adımlar:
+    1. normalize_plate() ile plakayı temizler.
+    2. get_or_create_vehicle() ile araç kaydını bulur veya oluşturur.
+    3. evaluate_access() ile durum → karar üretir.
+    4. should_log() ile cooldown kontrolü yapar.
+    5. Uygunsa create_access_log() ile erişim kaydı oluşturur.
+
+    Parametreler:
+        plate_text:     Kararlı OCR metni.
+        ocr_confidence: OCR güven değeri (0.0–1.0).
+        direction:      Giriş / çıkış / bilinmiyor.
+        source_camera:  Kamera kimliği.
+
+    Döndürür:
+        tuple[str, str, str]: (normalized_plate, status, decision)
+        None: Hata durumunda.
+    """
+    # 1. Plakayı normalize et; boş sonuç ValueError üretir
+    try:
+        normalized = normalize_plate(plate_text)
+    except ValueError as e:
+        print(f"Uyarı: Plaka normalize edilemedi: {e}")
+        return None
+
+    # 2. Veritabanı işlemleri
+    try:
+        with get_session() as session:
+            # Araç kaydını bul veya oluştur (UNIQUE korumalı)
+            vehicle, _ = get_or_create_vehicle(session, plate_text, normalized)
+
+            # Durum bilgisine göre erişim kararı üret
+            decision = evaluate_access(vehicle)
+
+            # Cooldown kontrolü: aynı plaka + yön için yakın zamanda log varsa atla
+            if should_log(session, normalized, direction):
+                create_access_log(
+                    session=session,
+                    vehicle=vehicle,
+                    plate_text=plate_text,
+                    normalized_plate=normalized,
+                    direction=direction,
+                    decision=decision,
+                    ocr_confidence=ocr_confidence,
+                    source_camera=source_camera,
+                )
+
+            return normalized, vehicle.status.value, decision.value
+
+    except SQLAlchemyError as e:
+        print(f"Hata: Veritabanı işlemi sırasında sorun oluştu: {e}")
+        return None
+    except Exception as e:
+        print(f"Hata: Beklenmeyen bir sorun oluştu: {e}")
+        return None
+
+
 def run_plate_ocr(camera_source: int = 0) -> None:
     """
     Kameradan canlı görüntü alır, YOLO ile plaka tespiti yapar,
     her 5 karede bir EasyOCR ile plaka metnini okur ve ekranda gösterir.
+    Kararlı plakalar veritabanına kaydedilir ve erişim kararı üretilir.
 
     Parametreler:
         camera_source (int): Kamera kaynağı indeksi (Varsayılan: 0)
     """
-    # 1. YOLO modeli ve EasyOCR Reader'ı kamera açılmadan önce bir kez yükle
+    # 1. Veritabanını başlat (kamera açılmadan önce zorunlu)
+    try:
+        init_db()
+    except Exception as e:
+        print(f"Hata: Veritabanı başlatılamadı: {e}")
+        print("Uygulama sonlandırılıyor.")
+        return
+
+    # 2. YOLO modeli ve EasyOCR Reader'ı kamera açılmadan önce bir kez yükle
     yolo_model = load_plate_model(DEFAULT_MODEL_PATH)
     if yolo_model is None:
         print("YOLO modeli yüklenemedi. Program sonlandırılıyor.")
@@ -299,6 +386,10 @@ def run_plate_ocr(camera_source: int = 0) -> None:
     # Düşük güvenli yeni okumalar bu sonucu değiştiremez
     en_iyi_metin = "OKUNAMADI"
     en_iyi_guven = 0.0
+
+    # Veritabanı entegrasyonu için durum değişkenleri
+    son_veritabani_metin = ""    # DB'ye en son gönderilen kararlı plaka metni
+    son_db_durum = ""            # Ekranda gösterilecek araç durumu (PENDING, APPROVED, vb.)
 
     # OCR geçmişi: son OCR_HISTORY_SIZE adet (metin, güven) çiftini saklar
     # deque, sınıra ulaşınca en eski kaydı otomatik siler
@@ -371,6 +462,11 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                         en_iyi_guven = 0.0
                         son_metin = "OKUNUYOR..."
                         son_guven = 0.0
+                        # Plaka kayboldu: tüm izleme değişkenlerini sıfırla
+                        # Araç yeniden görüldüğünde sıfırdan işlenebilsin
+                        son_yazdirilan_metin = ""
+                        son_veritabani_metin = ""
+                        son_db_durum = ""
 
                     # 6. Geçmişteki metinleri say ve kararlı sonucu belirle
                     if len(ocr_gecmisi) > 0:
@@ -401,16 +497,41 @@ def run_plate_ocr(camera_source: int = 0) -> None:
                             son_metin = gosterilecek_metin
                             son_guven = gosterilecek_guven
 
-                            # Terminale yalnızca metin değiştiğinde yaz
+                            # Yeni kararlı plaka oluştuğunda terminale yaz
                             if gosterilecek_metin != son_yazdirilan_metin:
                                 print(f"Plaka okundu: {gosterilecek_metin}  (Güven: {gosterilecek_guven})")
                                 son_yazdirilan_metin = gosterilecek_metin
 
+                            # Veritabanı işlemi: yalnızca yeni kararlı plaka oluştuğunda
+                            # (aynı plaka kamerada durduğu sürece bir kez işlenir)
+                            if gosterilecek_metin != son_veritabani_metin:
+                                db_sonuc = process_plate_access(
+                                    plate_text=gosterilecek_metin,
+                                    ocr_confidence=gosterilecek_guven,
+                                    source_camera="cam_0",
+                                )
+                                if db_sonuc is not None:
+                                    norm, durum, karar = db_sonuc
+                                    son_veritabani_metin = gosterilecek_metin
+                                    son_db_durum = durum.upper()
+                                    # Yapılandırılmış terminal çıktısı
+                                    print("-" * 40)
+                                    print(f"Plaka       : {norm}")
+                                    print(f"Durum       : {durum}")
+                                    print(f"Karar       : {karar}")
+                                    print(f"OCR Güveni  : {gosterilecek_guven}")
+                                    print("-" * 40)
+
                 # 6. Plaka kutusunu çiz
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                # 7. OCR sonucunu kutunun üzerine yaz
-                etiket = f"{son_metin} {son_guven}"
+                # 7. OCR sonucunu ve DB durumunu kutunun üzerine yaz
+                # DB işlemi başarılıysa: "34FRK052 | APPROVED"
+                # DB işlemi henüz yapılmadıysa: "OKUNUYOR..."
+                if son_db_durum:
+                    etiket = f"{son_metin} | {son_db_durum}"
+                else:
+                    etiket = son_metin
                 cv2.putText(
                     frame, etiket,
                     (x1, max(y1 - 8, 0)),
