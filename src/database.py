@@ -145,7 +145,8 @@ def get_session():
         with get_session() as session:
             araç = session.query(Vehicle).first()
     """
-    session: Session = SessionLocal()
+    factory = get_session_factory()
+    session: Session = factory()
     try:
         yield session
         session.commit()

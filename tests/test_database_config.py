@@ -76,6 +76,24 @@ class TestDatabaseConfig(unittest.TestCase):
         self.assertIn("@localhost:5432/testdb", sanitized)
 
 
+    def test_4_cloud_sql_unix_socket_url_format(self):
+        """
+        Cloud SQL Unix socket formatında (postgresql+psycopg2://...) URL verildiğinde
+        get_database_url() URL'yi aynen döndürmeli ve şifre maskelenmelidir.
+        """
+        cloud_sql_url = "postgresql+psycopg2://plaka_user:my_secret_password@/plaka_db?host=/cloudsql/plaka-tanima-abdullah-2026:europe-west1:plaka-postgres"
+        os.environ["DATABASE_URL"] = cloud_sql_url
+
+        url = get_database_url()
+        self.assertEqual(url, cloud_sql_url)
+
+        sanitized = sanitize_db_url(url)
+        self.assertNotIn("my_secret_password", sanitized)
+        self.assertIn("plaka_user:***", sanitized)
+        self.assertIn("plaka-postgres", sanitized)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
