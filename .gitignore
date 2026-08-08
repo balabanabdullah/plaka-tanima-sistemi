@@ -44,3 +44,4 @@ models/*.weights
 # OS files
 .DS_Store
 Thumbs.db
+cloud-sql-proxy.exe
