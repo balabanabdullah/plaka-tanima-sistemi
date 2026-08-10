@@ -24,6 +24,8 @@ from plate_service import (
     evaluate_access,
     create_access_log,
     should_log,
+    is_probable_same_plate,
+    get_next_auto_direction,
 )
 from models import AccessDirection
 from sqlalchemy.exc import SQLAlchemyError
@@ -313,27 +315,28 @@ def normalize_plate_text(text: str) -> str:
 def process_plate_access(
     plate_text: str,
     ocr_confidence: float,
-    direction: AccessDirection,
+    direction: AccessDirection | str,
     source_camera: str,
-) -> "tuple[str, str, str, bool] | None":
+) -> "tuple[str, str, str, bool, AccessDirection] | None":
     """
     Kararlı OCR metnini veritabanına kaydeder ve erişim kararı üretir.
 
     Adımlar:
     1. normalize_plate() ile plakayı temizler.
     2. get_or_create_vehicle() ile araç kaydını bulur veya oluşturur.
-    3. evaluate_access() ile durum → karar üretir.
-    4. should_log() ile cooldown kontrolü yapar.
-    5. Uygunsa create_access_log() ile erişim kaydı oluşturur.
+    3. direction == "auto" ise veritabanındaki son ALLOW kaydına göre entry/exit yönünü çözer.
+    4. evaluate_access() ile durum → karar üretir.
+    5. should_log() ile cooldown kontrolü yapar.
+    6. Uygunsa create_access_log() ile erişim kaydı oluşturur (çözümlenmiş yön ile).
 
     Parametreler:
         plate_text:     Kararlı OCR metni.
         ocr_confidence: OCR güven değeri (0.0–1.0).
-        direction:      Giriş / çıkış / bilinmiyor.
+        direction:      Giriş / çıkış / bilinmiyor veya "auto".
         source_camera:  Kamera kimliği.
 
     Döndürür:
-        tuple[str, str, str, bool]: (normalized_plate, status, decision, log_created)
+        tuple[str, str, str, bool, AccessDirection]: (normalized_plate, status, decision, log_created, resolved_direction)
         None: Hata durumunda.
     """
     # 1. Plakayı normalize et; boş sonuç ValueError üretir
@@ -349,18 +352,29 @@ def process_plate_access(
             # Araç kaydını bul veya oluştur (UNIQUE korumalı)
             vehicle, _ = get_or_create_vehicle(session, plate_text, normalized)
 
+            # Otomatik yön çözümlemesi ("auto" kipi veritabanı log geçmişine göre çözümlenir)
+            if direction == "auto" or (isinstance(direction, str) and direction.lower() == "auto"):
+                resolved_direction = get_next_auto_direction(session, vehicle)
+            elif isinstance(direction, str):
+                try:
+                    resolved_direction = AccessDirection(direction)
+                except ValueError:
+                    resolved_direction = AccessDirection.unknown
+            else:
+                resolved_direction = direction
+
             # Durum bilgisine göre erişim kararı üret
             decision = evaluate_access(vehicle)
 
             log_created = False
-            # Cooldown kontrolü: aynı plaka + yön için yakın zamanda log varsa atla
-            if should_log(session, normalized, direction):
+            # Cooldown kontrolü: aynı plaka + çözümlenmiş yön için yakın zamanda log varsa atla
+            if should_log(session, normalized, resolved_direction):
                 create_access_log(
                     session=session,
                     vehicle=vehicle,
                     plate_text=plate_text,
                     normalized_plate=normalized,
-                    direction=direction,
+                    direction=resolved_direction,
                     decision=decision,
                     ocr_confidence=ocr_confidence,
                     source_camera=source_camera,
@@ -371,11 +385,11 @@ def process_plate_access(
                         f"[DEBUG LOG] AccessLog oluşturuldu:\n"
                         f"  Plaka: {normalized}\n"
                         f"  Karar: {decision.value}\n"
-                        f"  Yön: {direction.value}\n"
+                        f"  Yön: {resolved_direction.value}\n"
                         f"  Kamera: {source_camera}"
                     )
 
-            return normalized, vehicle.status.value, decision.value, log_created
+            return normalized, vehicle.status.value, decision.value, log_created, resolved_direction
 
     except SQLAlchemyError as e:
         print(f"Hata: Veritabanı işlemi sırasında sorun oluştu: {e}")
@@ -466,7 +480,7 @@ def get_final_plate_candidate(
 
 def run_plate_ocr(
     camera_source: int = 0,
-    direction: AccessDirection = AccessDirection.unknown,
+    direction: AccessDirection | str = AccessDirection.unknown,
     source_camera: str = "cam_0",
     esp32_port: str | None = None,
     esp32_baud: int = 115200,
@@ -479,7 +493,7 @@ def run_plate_ocr(
 
     Parametreler:
         camera_source (int): Kamera kaynağı indeksi (Varsayılan: 0)
-        direction (AccessDirection): Kameranın hareket yönü (entry / exit / unknown)
+        direction (AccessDirection | str): Kameranın hareket yönü (entry / exit / unknown / "auto")
         source_camera (str): Kameranın adı (Varsayılan: "cam_0")
         esp32_port (str | None): ESP32 seri port adresi
         esp32_baud (int): ESP32 seri port hızı (Varsayılan: 115200)
@@ -529,18 +543,25 @@ def run_plate_ocr(
     en_iyi_metin = "OKUNAMADI"
     en_iyi_guven = 0.0
 
-    # Veritabanı entegrasyonu için durum değişkenleri
-    son_veritabani_metin = ""    # DB'ye en son gönderilen kararlı plaka metni
-    son_db_durum = ""            # Ekranda gösterilecek araç durumu (PENDING, APPROVED, vb.)
-    son_db_karar = ""            # Ekranda gösterilecek geçiş kararı (ALLOW, WAIT, DENY)
-    son_refresh_zamani = 0.0     # Son DB status refresh yapılma zamanı (time.monotonic)
+    # Veritabanı ve Fiziksel Olay (Physical Event) Durum Değişkenleri
+    son_veritabani_metin = ""        # DB'ye en son gönderilen kararlı plaka metni
+    son_db_durum = ""                # Ekranda gösterilecek araç durumu (PENDING, APPROVED, vb.)
+    son_db_karar = ""                # Ekranda gösterilecek geçiş kararı (ALLOW, WAIT, DENY)
+    son_refresh_zamani = 0.0         # Son DB status refresh yapılma zamanı (time.monotonic)
 
-    # Yeni plaka adayı takibi (eski plakadan hızlı geçiş için)
+    # Kesin Fiziksel Olay (Physical Event) State Machine Değişkenleri:
+    active_event_text = ""           # Aktif fiziksel olayın normalize edilmiş plaka metni
+    active_event_processed = False    # Bu fiziksel olay için process_plate_access() çağrıldı mı?
+    active_event_direction = None     # Bu olay için çözümlenmiş AccessDirection (entry / exit)
+    active_event_decision = ""       # Bu olay için veritabanında verilen karar (ALLOW, WAIT, DENY)
+    active_event_status = ""         # Bu olay için aracın veritabanı durumu (APPROVED, PENDING, vb.)
+    barrier_opened_for_event = False  # Aktif fiziksel olay boyunca bariyer EN FAZLA 1 KEZ tetiklenir
+
+    # Yeni plaka adayı takibi (eski plakadan farklı gerçek araç geçişi için)
     aday_metin = ""
     aday_tekrar = 0
 
     # OCR geçmişi: son OCR_HISTORY_SIZE adet (metin, güven) çiftini saklar
-    # deque, sınıra ulaşınca en eski kaydı otomatik siler
     ocr_gecmisi: deque[tuple[str, float]] = deque(maxlen=OCR_HISTORY_SIZE)
 
     # DB öncesi nihai doğrulama geçmişi (yalnızca filtrelenmiş geçerli okumalar)
@@ -554,10 +575,11 @@ def run_plate_ocr(
             print(f"Hata: {camera_source} indeksli kamera açılamadı! Bağlantıyı kontrol edin.")
             return
 
+        direction_display = direction if isinstance(direction, str) else direction.value
         print("-" * 40)
         print(f"Kamera       : {camera_source}")
         print(f"Kamera Adı   : {source_camera}")
-        print(f"Yön          : {direction.value}")
+        print(f"Yön Modu     : {direction_display}")
         print("-" * 40)
         print("Plaka OCR başlatıldı. Çıkmak için pencere üzerindeyken 'q' tuşuna basın.")
 
@@ -586,14 +608,13 @@ def run_plate_ocr(
                         print(f"[STATUS GÜNCELLENDİ] Plaka: {son_veritabani_metin} | Durum: {yeni_durum_up} | Karar: {yeni_karar_up}")
                         son_db_durum = yeni_durum_up
                         son_db_karar = yeni_karar_up
+                        active_event_status = yeni_durum_up
+                        active_event_decision = yeni_karar_up
                 else:
-                    # Web panelden araç silinmiş: DB durumu ve kaydını temizle
-                    # Araç tekrar okunduğunda yeni araç gibi (pending) işlenecektir
                     if DEBUG_OCR:
-                        print(f"[STATUS GÜNCELLENDİ] Araç silindi: {son_veritabani_metin}")
+                        print(f"[STATUS GÜNCELLENDİ] Araç silindi veya sorgulanamadı: {son_veritabani_metin}")
                     son_db_durum = ""
                     son_db_karar = ""
-                    son_veritabani_metin = ""
 
                 son_refresh_zamani = simdi_mono
 
@@ -646,57 +667,65 @@ def run_plate_ocr(
                         print(f"[DEBUG OCR] Boyut: {crop_w}x{crop_h} | Keskinlik: {sharpness:.1f} | OCR: '{okunan}' | Güven: {guven}")
 
                     if okunan != "OKUNAMADI":
-                        # Yeni plaka adayı takibi:
-                        # Mevcut kararlı bir veritabanı plakası varken farklı ve geçerli bir plaka okunursa:
-                        if son_veritabani_metin and okunan != son_veritabani_metin:
-                            if okunan == aday_metin:
-                                aday_tekrar += 1
-                            else:
-                                aday_metin = okunan
-                                aday_tekrar = 1
-
-                            # Farklı aday NEW_PLATE_CONFIRMATIONS kadar doğrulandıysa yeni araca geç!
-                            if aday_tekrar >= NEW_PLATE_CONFIRMATIONS:
-                                if DEBUG_OCR:
-                                    print(f"[YENİ PLAKA ALGILANDI] Eski: {son_veritabani_metin} -> Yeni Aday: {aday_metin}")
-
-                                # Tüm eski state'i temizle, yeni plakaya temiz başlangıç sağla
-                                ocr_gecmisi.clear()
-                                final_ocr_history.clear()
-                                basarisiz_sayisi = 0
-                                en_iyi_metin = "OKUNAMADI"
-                                en_iyi_guven = 0.0
-                                son_metin = "OKUNUYOR..."
-                                son_guven = 0.0
-                                son_yazdirilan_metin = ""
-                                son_veritabani_metin = ""
-                                son_db_durum = ""
-                                son_db_karar = ""
-                                son_refresh_zamani = 0.0
+                        # Fiziksel Olay ve OCR Varyasyonu (Gürültü) Bastırma:
+                        # Aktif bir fiziksel olay devam ederken (active_event_text dolu iken):
+                        if active_event_text:
+                            if is_probable_same_plate(okunan, active_event_text):
+                                # Aynı fiziksel araç: gürültüyü bastır, aday takibini sıfırla
                                 aday_metin = ""
                                 aday_tekrar = 0
+                            else:
+                                if okunan == aday_metin:
+                                    aday_tekrar += 1
+                                else:
+                                    aday_metin = okunan
+                                    aday_tekrar = 1
+
+                                # Gerçekten farklı plaka adayı NEW_PLATE_CONFIRMATIONS (4) kadar doğrulandıysa yeni olaya geç!
+                                if aday_tekrar >= NEW_PLATE_CONFIRMATIONS:
+                                    if DEBUG_OCR:
+                                        print(f"[YENİ PLAKA ALGILANDI] Eski Olay: {active_event_text} -> Yeni Aday: {aday_metin}")
+
+                                    # Tüm eski state'i temizle, yeni fiziksel olaya temiz başlangıç sağla
+                                    ocr_gecmisi.clear()
+                                    final_ocr_history.clear()
+                                    basarisiz_sayisi = 0
+                                    en_iyi_metin = "OKUNAMADI"
+                                    en_iyi_guven = 0.0
+                                    son_metin = "OKUNUYOR..."
+                                    son_guven = 0.0
+                                    son_yazdirilan_metin = ""
+                                    son_veritabani_metin = ""
+                                    son_db_durum = ""
+                                    son_db_karar = ""
+                                    son_refresh_zamani = 0.0
+
+                                    # Olay durumunu tamamen sıfırla
+                                    active_event_text = ""
+                                    active_event_processed = False
+                                    active_event_direction = None
+                                    active_event_decision = ""
+                                    active_event_status = ""
+                                    barrier_opened_for_event = False
+                                    aday_metin = ""
+                                    aday_tekrar = 0
                         else:
-                            # Okunan plaka mevcut kararlı plaka ile aynı ise aday takibini sıfırla
                             aday_metin = ""
                             aday_tekrar = 0
 
-                        # Başarılı okuma: geçmişlere ekle, başarısız sayacını sıfırla
+                        # Başarılı okumayı geçmişe ekle
                         ocr_gecmisi.append((okunan, guven))
                         final_ocr_history.append((okunan, guven))
                         basarisiz_sayisi = 0
 
-                        # En iyi sonucu güncelle:
-                        # Yalnızca yeni güven mevcut en iyi güvenden 0.02 daha yüksekse kabul et
                         if guven >= en_iyi_guven + 0.02:
                             en_iyi_metin = okunan
                             en_iyi_guven = guven
 
                     else:
-                        # Başarısız okuma: sayacı artır
                         basarisiz_sayisi += 1
 
-                    # OCR_STALE_LIMIT dolduğunda YALNIZCA OCR state'i temizle
-                    # son_veritabani_metin / aktif geçiş olayı SİLİNMEZ!
+                    # OCR_STALE_LIMIT dolduğunda YALNIZCA OCR state'i temizle (aktif geçiş olayı SİLİNMEZ!)
                     if basarisiz_sayisi >= OCR_STALE_LIMIT:
                         if DEBUG_OCR:
                             print("[OCR RESET] OCR geçmişi temizlendi ancak aktif geçiş korunuyor.")
@@ -707,7 +736,7 @@ def run_plate_ocr(
                         en_iyi_metin = "OKUNAMADI"
                         en_iyi_guven = 0.0
 
-                    # 6. DB öncesi nihai doğrulama katmanı (Final Plate Validation)
+                    # 6. DB öncesi nihai doğrulama ve Fiziksel Olay Yönetim Katmanı
                     if len(final_ocr_history) > 0:
                         final_aday = get_final_plate_candidate(final_ocr_history)
 
@@ -716,52 +745,64 @@ def run_plate_ocr(
 
                         if final_aday is not None:
                             final_metin, final_guven, tekrar_sayisi = final_aday
-                            gosterilecek_metin = final_metin
-                            gosterilecek_guven = final_guven
+                            son_metin = final_metin
+                            son_guven = final_guven
 
-                            # Ekran durumunu güncelle
-                            son_metin = gosterilecek_metin
-                            son_guven = gosterilecek_guven
+                            # Eğer henüz aktif bir fiziksel olay tanımlanmamışsa başlat
+                            if not active_event_text:
+                                active_event_text = final_metin
 
-                            # Veritabanı işlemi: yalnızca nihai olarak doğrulanmış YENİ plaka oluştuğunda
-                            if final_metin != son_veritabani_metin:
-                                if DEBUG_OCR:
-                                    print(f"[DB EVENT]\nPlaka: {final_metin}\nDirection: {direction.value}\nSource Camera: {source_camera}")
-                                db_sonuc = process_plate_access(
-                                    plate_text=final_metin,
-                                    ocr_confidence=final_guven,
-                                    direction=direction,
-                                    source_camera=source_camera,
-                                )
-                                if db_sonuc is not None:
-                                    norm, durum, karar, log_created = db_sonuc
-                                    son_veritabani_metin = final_metin
-                                    son_db_durum = durum.upper()
-                                    son_db_karar = karar.upper()
-                                    son_refresh_zamani = time.monotonic()
-                                    # Yapılandırılmış terminal çıktısı
-                                    print("-" * 40)
-                                    print(f"Final Plaka  : {norm}")
-                                    print(f"Tekrar       : {tekrar_sayisi}/{len(final_ocr_history)}")
-                                    print(f"Ort. Güven   : {final_guven}")
-                                    print(f"Durum        : {durum}")
-                                    print(f"Karar        : {karar}")
-                                    print(f"Yön          : {direction.value}")
-                                    print(f"Kamera       : {source_camera}")
-                                    print("-" * 40)
+                            # Doğrulanan nihai metin aktif fiziksel olay ile eşleşiyorsa (veya varyasyon ise):
+                            if is_probable_same_plate(final_metin, active_event_text):
+                                # KISITLAYICI KRİTİK KURAL:
+                                # active_event_processed == True ise, bu fiziksel araç varlığı için
+                                # process_plate_access() DAHA ÖNCE 1 KEZ ÇALIŞTIRILMIŞTIR!
+                                # Kesinlikle tekrar process_plate_access(), yön hesabı, log veya bariyer açma YAPMA!
+                                if not active_event_processed:
+                                    if DEBUG_OCR:
+                                        print(f"[DB EVENT START]\nPlaka: {final_metin}\nDirection Mode: {direction_display}\nSource Camera: {source_camera}")
 
-                                    # Yalnızca bariyer aktifse, YENİ bir erişim kaydı yazıldığında (log_created == True)
-                                    # VE karar "allow" ise ESP32 bariyer komutunu tetikle
-                                    if barrier is not None and karar == "allow" and log_created:
-                                        barrier.send_open()
+                                    db_sonuc = process_plate_access(
+                                        plate_text=final_metin,
+                                        ocr_confidence=final_guven,
+                                        direction=direction,
+                                        source_camera=source_camera,
+                                    )
+                                    if db_sonuc is not None:
+                                        norm, durum, karar, log_created, resolved_dir = db_sonuc
+
+                                        # Fiziksel Olay Durumunu İşlendi Olarak İşaretle!
+                                        active_event_processed = True
+                                        active_event_text = norm
+                                        active_event_direction = resolved_dir
+                                        active_event_decision = karar.upper()
+                                        active_event_status = durum.upper()
+
+                                        son_veritabani_metin = norm
+                                        son_db_durum = active_event_status
+                                        son_db_karar = active_event_decision
+                                        son_refresh_zamani = time.monotonic()
+
+                                        # Terminal Çıktısı (Her Fiziksel Olay Başında Yalnıca 1 Kez Basılır!)
+                                        print("-" * 40)
+                                        print(f"Final Plaka  : {norm}")
+                                        print(f"Tekrar       : {tekrar_sayisi}/{len(final_ocr_history)}")
+                                        print(f"Ort. Güven   : {final_guven}")
+                                        print(f"Durum        : {durum}")
+                                        print(f"Karar        : {karar}")
+                                        print(f"Yön (Çözülen): {resolved_dir.value}")
+                                        print(f"Kamera       : {source_camera}")
+                                        print("-" * 40)
+
+                                        # Bariyer Güvenliği: Aynı fiziksel geçiş boyunca ALLOW ise EN FAZLA 1 KEZ açar
+                                        if barrier is not None and karar == "allow" and log_created and not barrier_opened_for_event:
+                                            barrier.send_open()
+                                            barrier_opened_for_event = True
 
                 # 6. Plaka kutusunu çiz
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
                 # 7. OCR sonucunu, DB durumunu ve geçiş kararını kutunun üzerine yaz
-                # DB işlemi başarılıysa 2 satır olarak gösterilir:
-                #   Satır 1: "34FRK052 | APPROVED"
-                #   Satır 2: "ALLOW"
                 if son_db_durum:
                     karar_etiket = "WAIT" if "WAIT" in son_db_karar else son_db_karar
                     etiket1 = f"{son_metin} | {son_db_durum}"
@@ -790,11 +831,19 @@ def run_plate_ocr(
                         0.6, (0, 255, 0), 2
                     )
 
-            # 8. Plaka Gerçek Kaybolma Kontrolü (Event Reset)
-            # YOLO plaka tespiti 3.0 saniye boyunca gerçekleşmediyse araç sahneden çıkmıştır
-            if (time.monotonic() - last_plate_detection_time >= PLATE_ABSENCE_RESET_SECONDS) and son_veritabani_metin:
+            # 8. Plaka Gerçek Kaybolma Kontrolü (Physical Event Reset)
+            # YOLO plaka tespiti PLATE_ABSENCE_RESET_SECONDS (3.0s) boyunca gerçekleşmediyse araç sahneden çıkmıştır
+            if (time.monotonic() - last_plate_detection_time >= PLATE_ABSENCE_RESET_SECONDS) and (son_veritabani_metin or active_event_text):
                 if DEBUG_OCR:
-                    print("[EVENT RESET] Plaka 3.0 saniyedir görünmüyor. Aktif geçiş kapatıldı.")
+                    print("[EVENT RESET] Plaka 3.0 saniyedir görünmüyor. Aktif fiziksel geçiş kapatıldı.")
+
+                # Fiziksel Olay Durumunu Tamamen Sıfırla
+                active_event_text = ""
+                active_event_processed = False
+                active_event_direction = None
+                active_event_decision = ""
+                active_event_status = ""
+                barrier_opened_for_event = False
 
                 son_veritabani_metin = ""
                 son_db_durum = ""
@@ -853,9 +902,9 @@ def main() -> None:
     parser.add_argument(
         "--direction",
         type=str,
-        choices=["entry", "exit", "unknown"],
+        choices=["entry", "exit", "unknown", "auto"],
         default="unknown",
-        help="Kamera yönü: entry (giriş), exit (çıkış), unknown (bilinmiyor) (Varsayılan: unknown)",
+        help="Kamera yönü: entry (giriş), exit (çıkış), unknown (bilinmiyor), auto (otomatik) (Varsayılan: unknown)",
     )
     parser.add_argument(
         "--esp32-port",
@@ -880,15 +929,19 @@ def main() -> None:
     # Kamera adı verilmediyse cam_<camera_index> üret
     cam_name = args.camera_name if args.camera_name else f"cam_{args.camera}"
 
-    # Yön stringini AccessDirection enum'a dönüştür
-    try:
-        dir_enum = AccessDirection(args.direction)
-    except ValueError:
-        dir_enum = AccessDirection.unknown
+    # Yön argümanını çözümle ("auto" dize olarak kalır, diğerleri AccessDirection enum olur)
+    dir_raw = args.direction.lower()
+    if dir_raw == "auto":
+        dir_param: AccessDirection | str = "auto"
+    else:
+        try:
+            dir_param = AccessDirection(dir_raw)
+        except ValueError:
+            dir_param = AccessDirection.unknown
 
     run_plate_ocr(
         camera_source=args.camera,
-        direction=dir_enum,
+        direction=dir_param,
         source_camera=cam_name,
         esp32_port=args.esp32_port,
         esp32_baud=args.esp32_baud,

@@ -45,6 +45,239 @@ def normalize_plate(text: str) -> str:
     return text
 
 
+# ─────────────────────────────────────────────
+# Plaka Benzerliği / Varyasyon Bastırma
+# ─────────────────────────────────────────────
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """
+    İki dize arasındaki Levenshtein düzenleme mesafesini (edit distance) hesaplar.
+    """
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def is_probable_same_plate(text_a: str, text_b: str) -> bool:
+    """
+    İki ham veya normalize edilmiş OCR metninin aynı fiziksel plakaya ait
+    olup olmadığını muhafazakar bir yaklaşımla değerlendirir.
+
+    ÖNEMLİ: Bu fonksiyon YALNIZCA aynı canlı kamera geçiş olayı (event) sırasında
+    OCR varyasyonlarını (gürültülerini) bastırmak için bellekte (in-memory) kullanılır.
+    Kesinlikle veritabanındaki Vehicle kayıtlarını birleştirmez veya değiştirmez.
+
+    Muhafazakar Kurallar (False-Negative Tercih Edilir):
+    1. Boş metinler veya normalize edilemeyenler -> False.
+    2. Birebir eşitlik -> True.
+    3. Karakter uzunluğu farkı > 2 ise kesinlikle farklı plaka -> False.
+    4. Metin uzunlukları >= 6 ve fark <= 2 iken alt dize/içerme (örn: TR82TR37 - 82TR37) -> True.
+    5. Levenshtein mesafesi:
+       - 5-6 karakterli plakalar için max 1 düzenleme.
+       - 7 ve üzeri karakterli plakalar için max 2 düzenleme.
+    """
+    if not text_a or not text_b:
+        return False
+
+    try:
+        na = normalize_plate(text_a)
+        nb = normalize_plate(text_b)
+    except ValueError:
+        return False
+
+    if na == nb:
+        return True
+
+    len_a, len_b = len(na), len(nb)
+    if abs(len_a - len_b) > 2:
+        return False
+
+    min_len = min(len_a, len_b)
+    if min_len < 4:
+        return False
+
+    # Alt dize / ek parçalanması (örn. TR82TR37 vs 82TR37, 34FRK052 vs B34FRK052)
+    if min_len >= 6 and (na in nb or nb in na):
+        return True
+
+    dist = levenshtein_distance(na, nb)
+    max_len = max(len_a, len_b)
+
+    if max_len >= 7 and dist <= 2:
+        return True
+    if 5 <= max_len < 7 and dist <= 1:
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────
+# Otomatik Yön ve Varlık (Presence) Yönetimi
+# ─────────────────────────────────────────────
+
+def get_last_successful_allow_log(
+    session: Session,
+    vehicle: Vehicle,
+) -> AccessLog | None:
+    """
+    Verilen araç için veritabanında kayıtlı en son başarılı (ALLOW) geçiş kaydını döner.
+    WAIT_FOR_APPROVAL, DENY veya pending/rejected durumlarındaki loglar hesaba katılmaz.
+    """
+    if vehicle is None or vehicle.id is None:
+        return None
+
+    return (
+        session.query(AccessLog)
+        .filter(
+            AccessLog.vehicle_id == vehicle.id,
+            AccessLog.decision == AccessDecision.allow,
+        )
+        .order_by(AccessLog.detected_at.desc(), AccessLog.id.desc())
+        .first()
+    )
+
+
+def get_vehicle_presence_state(
+    session: Session,
+    vehicle: Vehicle,
+) -> str:
+    """
+    Aracın son başarılı (ALLOW) geçiş kaydına göre mevcut varlık durumunu döner.
+
+    Döndürülen Değerler:
+        - "inside"   : En son ALLOW kaydının yönü 'entry' ise
+        - "outside"  : En son ALLOW kaydının yönü 'exit' ise veya hiç ALLOW kaydı yoksa
+        - "unknown"  : En son ALLOW kaydının yönü 'unknown' ise
+    """
+    last_allow = get_last_successful_allow_log(session, vehicle)
+    if last_allow is None:
+        return "outside"
+
+    if last_allow.direction == AccessDirection.entry:
+        return "inside"
+    elif last_allow.direction == AccessDirection.exit:
+        return "outside"
+    else:
+        return "unknown"
+
+
+def get_next_auto_direction(
+    session: Session,
+    vehicle: Vehicle | None,
+) -> AccessDirection:
+    """
+    AUTO yön kipinde (--direction auto), aracın en son ALLOW kaydına göre
+    bir sonraki geçiş yönünü belirler.
+
+    Kurallar:
+        - Araç None veya hiç ALLOW kaydı yoksa (outside) -> entry
+        - En son ALLOW 'entry' ise (inside)              -> exit
+        - En son ALLOW 'exit' ise (outside)              -> entry
+        - En son ALLOW 'unknown' ise                     -> entry (güvenli varsayılan)
+    """
+    if vehicle is None:
+        return AccessDirection.entry
+
+    presence = get_vehicle_presence_state(session, vehicle)
+    if presence == "inside":
+        return AccessDirection.exit
+    elif presence == "outside":
+        return AccessDirection.entry
+    else:
+        return AccessDirection.entry
+
+
+def get_vehicles_presence_map(
+    session: Session,
+    vehicles: list[Vehicle],
+) -> dict[int, dict]:
+    """
+    Verilen araç listesi için varlık durumlarını ve son hareket bilgilerini
+    N+1 sorgu problemi yaratmadan verimli şekilde hesaplar.
+
+    Döndürür:
+        dict[vehicle_id, {
+            "presence_state": "inside" | "outside" | "unknown",
+            "presence_label": "İçeride" | "Dışarıda" | "Bilinmiyor",
+            "last_movement_label": "Giriş" | "Çıkış" | "-",
+            "last_movement_time": datetime | None
+        }]
+    """
+    result = {}
+    if not vehicles:
+        return result
+
+    vehicle_ids = [v.id for v in vehicles if v.id is not None]
+    if not vehicle_ids:
+        return result
+
+    from sqlalchemy import func
+    subq = (
+        session.query(
+            AccessLog.vehicle_id,
+            func.max(AccessLog.id).label("max_id"),
+        )
+        .filter(
+            AccessLog.vehicle_id.in_(vehicle_ids),
+            AccessLog.decision == AccessDecision.allow,
+        )
+        .group_by(AccessLog.vehicle_id)
+        .subquery()
+    )
+
+    latest_logs = (
+        session.query(AccessLog)
+        .join(subq, AccessLog.id == subq.c.max_id)
+        .all()
+    )
+
+    log_map = {log.vehicle_id: log for log in latest_logs}
+
+    for v in vehicles:
+        log = log_map.get(v.id)
+        if log is None:
+            state = "outside"
+            label = "Dışarıda"
+            m_label = "-"
+            m_time = None
+        else:
+            m_time = log.detected_at
+            if log.direction == AccessDirection.entry:
+                state = "inside"
+                label = "İçeride"
+                m_label = "Giriş"
+            elif log.direction == AccessDirection.exit:
+                state = "outside"
+                label = "Dışarıda"
+                m_label = "Çıkış"
+            else:
+                state = "unknown"
+                label = "Bilinmiyor"
+                m_label = "-"
+
+        result[v.id] = {
+            "presence_state": state,
+            "presence_label": label,
+            "last_movement_label": m_label,
+            "last_movement_time": m_time,
+        }
+
+    return result
+
+
+
 def get_vehicle_by_plate(
     session: Session,
     normalized_plate: str,

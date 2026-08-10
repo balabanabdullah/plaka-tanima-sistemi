@@ -1,15 +1,16 @@
 """
-sync_manager.py — Yerel Senkronizasyon Yöneticisi (Supervisor)
+sync_manager.py — Yerel HTTPS Senkronizasyon Yöneticisi (Supervisor)
 
-Bu modül, iki bağımsız senkronizasyon işçisini (worker) eşzamanlı (concurrent) olarak çalıştırır:
-1. LOCAL -> CLOUD (cloud_sync.py) — Araç ve Erişim Logu aktarımı
-2. CLOUD -> LOCAL (approval_sync.py) — Web panel yetki kararları aktarımı
+Bu modül, iki bağımsız HTTPS senkronizasyon işçisini (worker) eşzamanlı (concurrent) olarak çalıştırır:
+1. LOCAL -> CLOUD HTTPS API (cloud_sync.py) — Araç ve Erişim Logu aktarımı
+2. CLOUD -> LOCAL HTTPS API (approval_sync.py) — Web panel yetki kararları aktarımı
 
 İlkeler:
 1. İki senkronizasyon döngüsü (threads) birbirini engellemez.
 2. İnternet veya bulut kesintisinde manager kapanmaz; her işçi kendi aralığında tekrar dener.
-3. Yerel OCR, kamera ve bariyer sisteminden tamamen bağımsız ayrı bir süreçtir.
-4. Ctrl+C ile tüm işçiler durdurma sinyali (Event) alarak temiz bir şekilde sonlanır.
+3. Cloud SQL Auth Proxy gerektirmez; standart HTTPS (443) kullanır.
+4. Yerel OCR, kamera ve bariyer sisteminden tamamen bağımsız ayrı bir süreçtir.
+5. Ctrl+C ile tüm işçiler durdurma sinyali (Event) alarak temiz bir şekilde sonlanır.
 """
 
 import sys
@@ -31,7 +32,7 @@ from approval_sync import run_approval_sync
 
 class SyncManager:
     """
-    Çift yönlü senkronizasyon işçilerini yöneten Thread Supervisor sınıfı.
+    Çift yönlü HTTPS senkronizasyon işçilerini yöneten Thread Supervisor sınıfı.
     """
 
     def __init__(
@@ -39,6 +40,8 @@ class SyncManager:
         cloud_interval: int = 60,
         approval_interval: int = 30,
         local_url: Optional[str] = None,
+        sync_api_url: Optional[str] = None,
+        sync_token: Optional[str] = None,
         cloud_url: Optional[str] = None,
         dry_run: bool = False,
     ):
@@ -48,6 +51,8 @@ class SyncManager:
         self.cloud_interval = cloud_interval
         self.approval_interval = approval_interval
         self.local_url = local_url
+        self.sync_api_url = sync_api_url
+        self.sync_token = sync_token
         self.cloud_url = cloud_url
         self.dry_run = dry_run
 
@@ -57,36 +62,38 @@ class SyncManager:
 
     def _cloud_sync_worker(self) -> None:
         """
-        LOCAL -> CLOUD senkronizasyon döngüsü (Thread).
+        LOCAL -> CLOUD HTTPS senkronizasyon döngüsü (Thread).
         """
         while not self._stop_event.is_set():
             try:
                 run_sync(
                     local_url=self.local_url,
+                    sync_api_url=self.sync_api_url,
+                    sync_token=self.sync_token,
                     cloud_url=self.cloud_url,
                     dry_run=self.dry_run,
                 )
             except Exception as e:
                 print(f"[SYNC MANAGER HATA] LOCAL -> CLOUD worker istisnası: {e}")
 
-            # Bekleme süresi boyunca stop_event'i dinle
             self._stop_event.wait(self.cloud_interval)
 
     def _approval_sync_worker(self) -> None:
         """
-        CLOUD -> LOCAL yetki senkronizasyon döngüsü (Thread).
+        CLOUD -> LOCAL HTTPS yetki senkronizasyon döngüsü (Thread).
         """
         while not self._stop_event.is_set():
             try:
                 run_approval_sync(
                     local_url=self.local_url,
+                    sync_api_url=self.sync_api_url,
+                    sync_token=self.sync_token,
                     cloud_url=self.cloud_url,
                     dry_run=self.dry_run,
                 )
             except Exception as e:
                 print(f"[SYNC MANAGER HATA] CLOUD -> LOCAL worker istisnası: {e}")
 
-            # Bekleme süresi boyunca stop_event'i dinle
             self._stop_event.wait(self.approval_interval)
 
     def start(self) -> None:
@@ -146,7 +153,7 @@ def main() -> None:
             pass
 
     parser = argparse.ArgumentParser(
-        description="Plaka Tanima Sistemi - Cift Yonlu Senkronizasyon Yoneticisi"
+        description="Plaka Tanima Sistemi - Cift Yonlu HTTPS Senkronizasyon Yoneticisi"
     )
     parser.add_argument(
         "--cloud-interval",
@@ -172,10 +179,16 @@ def main() -> None:
         help="Özel yerel veritabanı adresi",
     )
     parser.add_argument(
-        "--cloud-url",
+        "--sync-api-url",
         type=str,
         default=None,
-        help="Özel bulut veritabanı adresi",
+        help="Özel bulut HTTPS API adresi (Varsayılan: CLOUD_SYNC_API_URL)",
+    )
+    parser.add_argument(
+        "--sync-token",
+        type=str,
+        default=None,
+        help="Özel senkronizasyon token'ı (Varsayılan: SYNC_API_TOKEN)",
     )
 
     args = parser.parse_args()
@@ -188,13 +201,13 @@ def main() -> None:
         cloud_interval=args.cloud_interval,
         approval_interval=args.approval_interval,
         local_url=args.local_url,
-        cloud_url=args.cloud_url,
+        sync_api_url=args.sync_api_url,
+        sync_token=args.sync_token,
         dry_run=args.dry_run,
     )
 
     try:
         manager.start()
-        # Ana thread Ctrl+C gelene kadar bekler
         while True:
             time.sleep(1)
     except KeyboardInterrupt:

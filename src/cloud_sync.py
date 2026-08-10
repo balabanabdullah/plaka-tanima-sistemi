@@ -1,25 +1,31 @@
 """
-cloud_sync.py — Çevrimdışı Öncelikli Tek Yönlü Veritabanı Senkronizasyon Modülü
+cloud_sync.py — Çevrimdışı Öncelikli Tek Yönlü HTTPS Senkronizasyon Modülü
 
 Bu modül, yerel SQLite veritabanındaki Araç (Vehicle) ve Erişim Kaydı (AccessLog)
-verilerini bulut PostgreSQL (Cloud SQL) veritabanına tek yönlü (LOCAL -> CLOUD)
-olarak aktarır.
+verilerini Cloud Run üzerinde çalışan FastAPI HTTPS API servisine (/api/sync/push)
+tek yönlü (LOCAL -> CLOUD) olarak aktarır.
 
 Önemli İlkeler:
 1. Yerel SQLite ana çalışma ortamıdır; kamera, OCR ve bariyer kararları bulut
    bağlantısından bağımsız çalışmaya devam eder.
 2. Senkronizasyon hatası veya internet kesintisi hiçbir şekilde OCR veya bariyer sistemini durdurmaz.
-3. CLOUD_DATABASE_URL çevre değişkeni tanımlanmamışsa senkronizasyon güvenle sonlanır.
-4. Senkronizasyon idempottur (tekrarlanabilir); aynı veriler tekrar aktarıldığında mükerrer kayıt oluşmaz.
-5. Veriler birincil anahtar (ID) yerine benzersiz UUID (sync_id) üzerinden eşleştirilir.
+3. CLOUD_SYNC_API_URL veya SYNC_API_TOKEN tanımlanmamışsa senkronizasyon güvenle atlanır.
+4. Doğrudan veritabanı portları (3307 / 5433) kullanılmaz; standart HTTPS (443) kullanılır.
+5. Senkronizasyon idempottur (tekrarlanabilir); aynı veriler tekrar aktarıldığında mükerrer kayıt oluşmaz.
+6. Veriler birincil anahtar (ID) yerine benzersiz UUID (sync_id) üzerinden eşleştirilir.
 """
 
 import sys
+import os
 import time
 import argparse
 import uuid
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from datetime import datetime, timezone
+from typing import Tuple, Dict, Any, List, Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
@@ -30,43 +36,38 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from database import DEFAULT_DB_PATH, sanitize_db_url
+from database import DEFAULT_DB_PATH
 from models import Base, Vehicle, AccessLog
 
 
 def get_local_db_url() -> str:
-    """
-    Senkronizasyon için varsayılan yerel SQLite URL'sini döndürür.
-    """
+    """Senkronizasyon için varsayılan yerel SQLite URL'sini döndürür."""
     return f"sqlite:///{DEFAULT_DB_PATH}"
 
 
-def get_cloud_db_url() -> str:
-    """
-    CLOUD_DATABASE_URL çevre değişkeninden bulut veritabanı adresini okur.
-    """
-    import os
-    return os.environ.get("CLOUD_DATABASE_URL", "").strip()
+def get_cloud_sync_api_url() -> str:
+    """CLOUD_SYNC_API_URL çevre değişkeninden bulut HTTPS API adresini okur."""
+    return os.environ.get("CLOUD_SYNC_API_URL", "").strip()
+
+
+def get_sync_api_token() -> str:
+    """SYNC_API_TOKEN çevre değişkeninden senkronizasyon yetki token'ını okur."""
+    return os.environ.get("SYNC_API_TOKEN", "").strip()
 
 
 def ensure_local_sync_ids(local_session: Session) -> Tuple[int, int]:
     """
     Mevcut yerel kayıtlarda sync_id (UUID) bulunmayan satırlara yeni UUID atar.
     Bu işlem geriye dönük uyumluluk sağlar ve mevcut verileri bozmaz.
-
-    Döndürür:
-        Tuple[int, int]: (guncellenen_arac_sayisi, guncellenen_log_sayisi)
     """
     updated_vehicles = 0
     updated_logs = 0
 
-    # sync_id boş olan araçlar
     vehicles_without_sync_id = local_session.query(Vehicle).filter(Vehicle.sync_id.is_(None)).all()
     for v in vehicles_without_sync_id:
         v.sync_id = str(uuid.uuid4())
         updated_vehicles += 1
 
-    # sync_id boş olan erişim logları
     logs_without_sync_id = local_session.query(AccessLog).filter(AccessLog.sync_id.is_(None)).all()
     for log in logs_without_sync_id:
         log.sync_id = str(uuid.uuid4())
@@ -78,13 +79,9 @@ def ensure_local_sync_ids(local_session: Session) -> Tuple[int, int]:
     return updated_vehicles, updated_logs
 
 
-from datetime import datetime, timezone
-
-
 def normalize_dt(dt: Any) -> float | None:
     """
     Tarih/saat değerlerini karşılaştırma için saniye duyarlılığında UTC Unix timestamp'ine dönüştürür.
-    Timezone-aware ve timezone-naive uyumsuzluklarını ve mikro-saniye farklarını giderir.
     """
     if dt is None:
         return None
@@ -103,7 +100,6 @@ def normalize_dt(dt: Any) -> float | None:
 def normalize_str(val: Any) -> str | None:
     """
     Metin ve Enum değerlerini karşılaştırma için standart dize biçimine dönüştürür.
-    None ile boş dize farklarını ve Enum nesnesi dize farklarını giderir.
     """
     if val is None:
         return None
@@ -113,171 +109,75 @@ def normalize_str(val: Any) -> str | None:
     return s if s else None
 
 
-def vehicle_has_changes(lv: Vehicle, cv: Vehicle) -> bool:
+def send_https_push(
+    sync_api_url: str,
+    sync_token: str,
+    payload: dict,
+    timeout: float = 15.0,
+) -> Tuple[bool, dict]:
     """
-    Yerel (lv) ve Bulut (cv) araç kayıtları arasındaki gerçek veri değişikliklerini
-    tür ve saat dilimi bağımsız olarak karşılaştırır.
+    Python standart kütüphanesi (urllib.request) ile HTTPS POST isteği gönderir.
+    Token hiçbir şekilde loglanmaz veya ekrana yazdırılmaz.
     """
-    if lv.sync_id and normalize_str(lv.sync_id) != normalize_str(cv.sync_id):
-        return True
-    if normalize_str(lv.plate_text) != normalize_str(cv.plate_text):
-        return True
-    if normalize_str(lv.normalized_plate) != normalize_str(cv.normalized_plate):
-        return True
-    if normalize_str(lv.status) != normalize_str(cv.status):
-        return True
-    if normalize_str(lv.approved_by) != normalize_str(cv.approved_by):
-        return True
-    if normalize_str(lv.notes) != normalize_str(cv.notes):
-        return True
+    url = sync_api_url.rstrip("/") + "/api/sync/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {sync_token}",
+        "User-Agent": "Plaka-Local-Sync/1.0",
+    }
 
-    if normalize_dt(lv.first_seen_at) != normalize_dt(cv.first_seen_at):
-        return True
-    if normalize_dt(lv.last_seen_at) != normalize_dt(cv.last_seen_at):
-        return True
-    if normalize_dt(lv.created_at) != normalize_dt(cv.created_at):
-        return True
-    if normalize_dt(lv.updated_at) != normalize_dt(cv.updated_at):
-        return True
-    if normalize_dt(lv.approved_at) != normalize_dt(cv.approved_at):
-        return True
-
-    return False
-
-
-def sync_vehicles(
-    local_session: Session,
-    cloud_session: Session,
-    dry_run: bool = False,
-) -> Tuple[int, int, int]:
-    """
-    Vehicle kayıtlarını yerelden buluta aktarır/günceller.
-
-    Döndürür:
-        Tuple[int, int, int]: (yeni_eklenen, guncellenen, degismeyen)
-    """
-    created_count = 0
-    updated_count = 0
-    unchanged_count = 0
-
-    local_vehicles = local_session.query(Vehicle).all()
-
-    for lv in local_vehicles:
-        # Önce sync_id ile, yoksa normalized_plate ile bulut veritabanında ara
-        cv = None
-        if lv.sync_id:
-            cv = cloud_session.query(Vehicle).filter_by(sync_id=lv.sync_id).first()
-        if cv is None:
-            cv = cloud_session.query(Vehicle).filter_by(normalized_plate=lv.normalized_plate).first()
-
-        if cv is None:
-            # Bulutta yok: Yeni kayıt oluştur
-            new_cv = Vehicle(
-                sync_id=lv.sync_id or str(uuid.uuid4()),
-                plate_text=lv.plate_text,
-                normalized_plate=lv.normalized_plate,
-                status=lv.status,
-                first_seen_at=lv.first_seen_at,
-                last_seen_at=lv.last_seen_at,
-                created_at=lv.created_at,
-                updated_at=lv.updated_at,
-                approved_at=lv.approved_at,
-                approved_by=lv.approved_by,
-                notes=lv.notes,
-            )
-            if not dry_run:
-                cloud_session.add(new_cv)
-            created_count += 1
-        else:
-            # Bulutta var: Güncelleme gerekiyor mu kontrol et
-            if vehicle_has_changes(lv, cv):
-                if not dry_run:
-                    if lv.sync_id and not cv.sync_id:
-                        cv.sync_id = lv.sync_id
-                    cv.plate_text = lv.plate_text
-                    cv.normalized_plate = lv.normalized_plate
-                    cv.status = lv.status
-                    cv.first_seen_at = lv.first_seen_at
-                    cv.last_seen_at = lv.last_seen_at
-                    cv.created_at = lv.created_at
-                    cv.updated_at = lv.updated_at
-                    cv.approved_at = lv.approved_at
-                    cv.approved_by = lv.approved_by
-                    cv.notes = lv.notes
-                updated_count += 1
+    try:
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status == 200:
+                res_body = response.read().decode("utf-8")
+                return True, json.loads(res_body)
             else:
-                unchanged_count += 1
+                print(f"[CLOUD SYNC HATA] Sunucu yanıtı: HTTP {response.status}")
+                return False, {}
+    except urllib.error.HTTPError as e:
+        print(f"[CLOUD SYNC HATA] HTTP Hatası: {e.code}")
+        return False, {}
+    except urllib.error.URLError as e:
+        print(f"[CLOUD SYNC HATA] Ağ Bağlantı Hatası: {e.reason}")
+        return False, {}
+    except Exception as e:
+        print(f"[CLOUD SYNC HATA] Senkronizasyon isteği başarısız: {e}")
+        return False, {}
 
-    return created_count, updated_count, unchanged_count
 
-
-def sync_access_logs(
-    local_session: Session,
-    cloud_session: Session,
-    dry_run: bool = False,
-) -> Tuple[int, int, int]:
+def get_sync_api_config(
+    sync_api_url: str | None = None,
+    sync_token: str | None = None,
+) -> Tuple[str, str]:
     """
-    AccessLog kayıtlarını yerelden buluta aktarır.
-
-    Döndürür:
-        Tuple[int, int, int]: (yeni_eklenen, guncellenen, degismeyen)
+    Parametre olarak verilen veya ortam değişkenlerinden okunan güncel
+    HTTPS API URL ve Token değerlerini döndürür.
     """
-    created_count = 0
-    updated_count = 0
-    unchanged_count = 0
-
-    local_logs = local_session.query(AccessLog).all()
-
-    for ll in local_logs:
-        # sync_id ile bulut veritabanında ara
-        cl = None
-        if ll.sync_id:
-            cl = cloud_session.query(AccessLog).filter_by(sync_id=ll.sync_id).first()
-
-        if cl is not None:
-            unchanged_count += 1
-            continue
-
-        # Buluttaki karşılık gelen araç kaydını bul (vehicle_id ilişkilendirmesi için)
-        cloud_vehicle_id = None
-        if ll.vehicle is not None:
-            cv = None
-            if ll.vehicle.sync_id:
-                cv = cloud_session.query(Vehicle).filter_by(sync_id=ll.vehicle.sync_id).first()
-            if cv is None:
-                cv = cloud_session.query(Vehicle).filter_by(normalized_plate=ll.vehicle.normalized_plate).first()
-            if cv is not None:
-                cloud_vehicle_id = cv.id
-
-        new_cl = AccessLog(
-            sync_id=ll.sync_id or str(uuid.uuid4()),
-            vehicle_id=cloud_vehicle_id,
-            plate_text=ll.plate_text,
-            normalized_plate=ll.normalized_plate,
-            direction=ll.direction,
-            decision=ll.decision,
-            ocr_confidence=ll.ocr_confidence,
-            detected_at=ll.detected_at,
-            image_path=ll.image_path,
-            source_camera=ll.source_camera,
-            denial_reason=ll.denial_reason,
-        )
-
-        if not dry_run:
-            cloud_session.add(new_cl)
-        created_count += 1
-
-    return created_count, updated_count, unchanged_count
+    resolved_url = (
+        sync_api_url
+        if sync_api_url is not None
+        else os.environ.get("CLOUD_SYNC_API_URL", "").strip()
+    )
+    resolved_token = (
+        sync_token
+        if sync_token is not None
+        else os.environ.get("SYNC_API_TOKEN", "").strip()
+    )
+    return resolved_url, resolved_token
 
 
 def run_sync(
     local_url: str | None = None,
+    sync_api_url: str | None = None,
+    sync_token: str | None = None,
     cloud_url: str | None = None,
     dry_run: bool = False,
     verbose: bool = False,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
-    Tek yönlü (LOCAL -> CLOUD) senkronizasyon işlemini yürütür.
+    Tek yönlü (LOCAL -> CLOUD HTTPS API) senkronizasyon işlemini yürütür.
 
     Döndürür:
         Tuple[bool, Dict[str, Any]]: (başarılı_mı, istatistikler_sözlüğü)
@@ -289,16 +189,15 @@ def run_sync(
         "duration": 0.0,
     }
 
-    resolved_local_url = local_url or get_local_db_url()
-    resolved_cloud_url = cloud_url or get_cloud_db_url()
+    resolved_local_url = local_url if local_url is not None else get_local_db_url()
+    resolved_api_url, resolved_token = get_sync_api_config(sync_api_url, sync_token)
 
-    if not resolved_cloud_url:
-        print("[CLOUD SYNC] CLOUD_DATABASE_URL tanımlanmamış veya boş.")
-        print("[CLOUD SYNC] Senkronizasyon yapılmadı. Yerel uygulama kesintisiz çalışmaya devam ediyor.")
+    if not resolved_api_url or not resolved_token:
+        print("[CLOUD SYNC] CLOUD_SYNC_API_URL veya SYNC_API_TOKEN tanımlanmamış.")
+        print("[CLOUD SYNC] Senkronizasyon atlandı. Yerel uygulama kesintisiz çalışmaya devam ediyor.")
         return True, stats
 
     try:
-        # 1. Yerel veritabanı bağlantısı ve şema güncellemesi
         local_connect_args = {"check_same_thread": False} if resolved_local_url.startswith("sqlite") else {}
         local_engine = create_engine(resolved_local_url, connect_args=local_connect_args)
         Base.metadata.create_all(bind=local_engine)
@@ -306,34 +205,74 @@ def run_sync(
         _ensure_schema_upgrades(local_engine)
         LocalSession = sessionmaker(bind=local_engine)
 
-        # 2. Bulut veritabanı bağlantısı ve şema güncellemesi
-        cloud_connect_args = {"check_same_thread": False} if resolved_cloud_url.startswith("sqlite") else {}
-        cloud_engine = create_engine(resolved_cloud_url, connect_args=cloud_connect_args)
-        Base.metadata.create_all(bind=cloud_engine)
-        _ensure_schema_upgrades(cloud_engine)
-        CloudSession = sessionmaker(bind=cloud_engine)
-
         with LocalSession() as local_session:
-            # 3. Yerel tablolara gerekiyorsa eksik UUID'leri yaz
             up_v, up_l = ensure_local_sync_ids(local_session)
             if verbose and (up_v > 0 or up_l > 0):
                 print(f"[LOCAL RECOVERY] {up_v} araç ve {up_l} erişim loguna yeni UUID atandı.")
 
-            with CloudSession() as cloud_session:
-                # 4. Araçları senkronize et
-                v_new, v_upd, v_unc = sync_vehicles(local_session, cloud_session, dry_run=dry_run)
-                if not dry_run and (v_new > 0 or v_upd > 0):
-                    cloud_session.commit()
+            local_vehicles = local_session.query(Vehicle).all()
+            local_logs = local_session.query(AccessLog).all()
 
-                # 5. Erişim kayıtlarını senkronize et
-                l_new, l_upd, l_unc = sync_access_logs(local_session, cloud_session, dry_run=dry_run)
-                if not dry_run and l_new > 0:
-                    cloud_session.commit()
+            vehicles_payload = []
+            for v in local_vehicles:
+                vehicles_payload.append({
+                    "sync_id": v.sync_id,
+                    "plate_text": v.plate_text,
+                    "normalized_plate": v.normalized_plate,
+                    "status": v.status.value if hasattr(v.status, "value") else str(v.status),
+                    "approved_at": v.approved_at.isoformat() if v.approved_at else None,
+                    "approved_by": v.approved_by,
+                    "first_seen_at": v.first_seen_at.isoformat() if v.first_seen_at else None,
+                    "last_seen_at": v.last_seen_at.isoformat() if v.last_seen_at else None,
+                    "notes": v.notes,
+                })
 
-                if dry_run:
-                    cloud_session.rollback()
+            v_id_to_sync_id = {v.id: v.sync_id for v in local_vehicles if v.id and v.sync_id}
 
+            logs_payload = []
+            for log in local_logs:
+                v_sync_id = v_id_to_sync_id.get(log.vehicle_id)
+                logs_payload.append({
+                    "sync_id": log.sync_id,
+                    "vehicle_sync_id": v_sync_id,
+                    "plate_text": log.plate_text,
+                    "normalized_plate": log.normalized_plate,
+                    "direction": log.direction.value if hasattr(log.direction, "value") else str(log.direction),
+                    "decision": log.decision.value if hasattr(log.decision, "value") else str(log.decision),
+                    "ocr_confidence": log.ocr_confidence,
+                    "source_camera": log.source_camera,
+                    "detected_at": log.detected_at.isoformat() if log.detected_at else None,
+                })
+
+            payload = {
+                "vehicles": vehicles_payload,
+                "access_logs": logs_payload,
+            }
+
+            if dry_run:
                 duration = time.monotonic() - start_time
+                stats = {
+                    "vehicles": {"new": len(vehicles_payload), "updated": 0, "unchanged": 0},
+                    "access_logs": {"new": len(logs_payload), "updated": 0, "unchanged": 0},
+                    "duration": round(duration, 2),
+                }
+                print("[CLOUD SYNC] DRY RUN — Sunucuya veri gönderilmedi.")
+                print(f"Hazırlanan araç: {len(vehicles_payload)}, erişim logu: {len(logs_payload)}")
+                return True, stats
+
+            success, api_res = send_https_push(resolved_api_url, resolved_token, payload)
+            duration = time.monotonic() - start_time
+
+            if success and api_res:
+                v_stats = api_res.get("vehicles", {})
+                l_stats = api_res.get("access_logs", {})
+                v_new = v_stats.get("new", 0)
+                v_upd = v_stats.get("updated", 0)
+                v_unc = v_stats.get("unchanged", 0)
+                l_new = l_stats.get("new", 0)
+                l_upd = l_stats.get("updated", 0)
+                l_unc = l_stats.get("unchanged", 0)
+
                 stats = {
                     "vehicles": {"new": v_new, "updated": v_upd, "unchanged": v_unc},
                     "access_logs": {"new": l_new, "updated": l_upd, "unchanged": l_unc},
@@ -354,10 +293,13 @@ def run_sync(
                 print(f"Duration: {duration:.2f} seconds")
 
                 return True, stats
+            else:
+                print("[CLOUD SYNC HATA] Yerel veriler korundu. Yerel OCR sistemi çalışmaya devam ediyor.")
+                stats["duration"] = round(duration, 2)
+                return False, stats
 
     except Exception as e:
-        sanitized_cloud = sanitize_db_url(resolved_cloud_url)
-        print(f"[CLOUD SYNC HATA] Senkronizasyon hatası ({sanitized_cloud}): {e}")
+        print(f"[CLOUD SYNC HATA] Senkronizasyon hatası: {e}")
         print("[CLOUD SYNC HATA] Yerel veriler korundu. Yerel OCR sistemi çalışmaya devam ediyor.")
         duration = time.monotonic() - start_time
         stats["duration"] = round(duration, 2)
@@ -366,18 +308,14 @@ def run_sync(
 
 def run_watch_mode(
     local_url: str | None = None,
+    sync_api_url: str | None = None,
+    sync_token: str | None = None,
     cloud_url: str | None = None,
     dry_run: bool = False,
     interval: int = 60,
     max_iterations: int | None = None,
 ) -> None:
-    """
-    Sürekli senkronizasyon (watch) modunu yürütür.
-
-    Parametreler:
-        interval (int): Döngüler arası bekleme süresi (saniye)
-        max_iterations (int | None): Testler için maksimum döngü sayısı (None = sonsuz)
-    """
+    """Sürekli senkronizasyon (watch) modunu yürütür."""
     if interval <= 0:
         print("[CLOUD SYNC HATA] --interval 0'dan büyük bir tamsayı olmalıdır.")
         raise ValueError("--interval 0'dan büyük bir tamsayı olmalıdır.")
@@ -386,7 +324,13 @@ def run_watch_mode(
     iterations = 0
     try:
         while True:
-            run_sync(local_url=local_url, cloud_url=cloud_url, dry_run=dry_run)
+            run_sync(
+                local_url=local_url,
+                sync_api_url=sync_api_url,
+                sync_token=sync_token,
+                cloud_url=cloud_url,
+                dry_run=dry_run,
+            )
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 break
@@ -396,9 +340,7 @@ def run_watch_mode(
 
 
 def main() -> None:
-    """
-    CLI giriş noktası.
-    """
+    """CLI giriş noktası."""
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -406,7 +348,7 @@ def main() -> None:
             pass
 
     parser = argparse.ArgumentParser(
-        description="Plaka Tanima Sistemi - Cevrimdisi Oncelikli Tek Yonlu Bulut Senkronizasyonu"
+        description="Plaka Tanıma Sistemi - HTTPS API Bulut Senkronizasyonu"
     )
     parser.add_argument(
         "--watch",
@@ -422,7 +364,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Bulut veritabanına yazmadan senkronize edilecek verileri incele",
+        help="Sunucuya veri göndermeden hazırlanacak paket bilgisini incele",
     )
     parser.add_argument(
         "--local-url",
@@ -431,10 +373,16 @@ def main() -> None:
         help="Özel yerel veritabanı adresi (Varsayılan: data/plate_system.db)",
     )
     parser.add_argument(
-        "--cloud-url",
+        "--sync-api-url",
         type=str,
         default=None,
-        help="Özel bulut veritabanı adresi (Varsayılan: CLOUD_DATABASE_URL)",
+        help="Özel bulut HTTPS API adresi (Varsayılan: CLOUD_SYNC_API_URL)",
+    )
+    parser.add_argument(
+        "--sync-token",
+        type=str,
+        default=None,
+        help="Özel senkronizasyon token'ı (Varsayılan: SYNC_API_TOKEN)",
     )
 
     args = parser.parse_args()
@@ -446,17 +394,18 @@ def main() -> None:
     if args.watch:
         run_watch_mode(
             local_url=args.local_url,
-            cloud_url=args.cloud_url,
+            sync_api_url=args.sync_api_url,
+            sync_token=args.sync_token,
             dry_run=args.dry_run,
             interval=args.interval,
         )
     else:
         success, _ = run_sync(
             local_url=args.local_url,
-            cloud_url=args.cloud_url,
+            sync_api_url=args.sync_api_url,
+            sync_token=args.sync_token,
             dry_run=args.dry_run,
         )
-
         if not success:
             sys.exit(1)
 
