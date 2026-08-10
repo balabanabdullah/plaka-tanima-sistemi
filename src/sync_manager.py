@@ -28,6 +28,7 @@ if str(SRC_PATH) not in sys.path:
 
 from cloud_sync import run_sync
 from approval_sync import run_approval_sync
+from sync_signal import DEFAULT_SYNC_SIGNAL_PATH, get_sync_signal_version
 
 
 class SyncManager:
@@ -44,6 +45,9 @@ class SyncManager:
         sync_token: Optional[str] = None,
         cloud_url: Optional[str] = None,
         dry_run: bool = False,
+        signal_path: Optional[str | Path] = None,
+        signal_poll_interval: float = 0.25,
+        signal_debounce: float = 0.30,
     ):
         if cloud_interval <= 0 or approval_interval <= 0:
             raise ValueError("Senkronizasyon aralıkları 0'dan büyük olmalıdır.")
@@ -55,6 +59,9 @@ class SyncManager:
         self.sync_token = sync_token
         self.cloud_url = cloud_url
         self.dry_run = dry_run
+        self.signal_path = Path(signal_path) if signal_path else DEFAULT_SYNC_SIGNAL_PATH
+        self.signal_poll_interval = signal_poll_interval
+        self.signal_debounce = signal_debounce
 
         self._stop_event = threading.Event()
         self._cloud_thread: Optional[threading.Thread] = None
@@ -64,7 +71,12 @@ class SyncManager:
         """
         LOCAL -> CLOUD HTTPS senkronizasyon döngüsü (Thread).
         """
+        handled_signal = get_sync_signal_version(self.signal_path)
+
         while not self._stop_event.is_set():
+            # Bu surume kadar commit edilmis kayitlar asagidaki sync payload'ina
+            # dahil edilir. Sync devam ederken daha yeni sinyal gelirse korunur.
+            signal_before_sync = get_sync_signal_version(self.signal_path)
             try:
                 run_sync(
                     local_url=self.local_url,
@@ -76,7 +88,23 @@ class SyncManager:
             except Exception as e:
                 print(f"[SYNC MANAGER HATA] LOCAL -> CLOUD worker istisnası: {e}")
 
-            self._stop_event.wait(self.cloud_interval)
+            handled_signal = max(handled_signal, signal_before_sync)
+            periodic_deadline = time.monotonic() + self.cloud_interval
+
+            while not self._stop_event.is_set():
+                remaining = periodic_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                wait_time = min(self.signal_poll_interval, remaining)
+                if self._stop_event.wait(wait_time):
+                    break
+
+                current_signal = get_sync_signal_version(self.signal_path)
+                if current_signal > handled_signal:
+                    # Kisa aralikta gelen cok sayida kaydi tek push'ta birlestir.
+                    self._stop_event.wait(self.signal_debounce)
+                    break
 
     def _approval_sync_worker(self) -> None:
         """

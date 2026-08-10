@@ -26,6 +26,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from sync_manager import SyncManager
+from sync_signal import request_immediate_sync
 
 
 class TestSyncManager(unittest.TestCase):
@@ -36,6 +37,20 @@ class TestSyncManager(unittest.TestCase):
     def setUp(self):
         self.local_url = "sqlite:///:memory:"
         self.cloud_url = "sqlite:///:memory:"
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.signal_path = Path(self.temp_dir.name) / "sync_wakeup"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def wait_for_call_count(self, mock_function, expected: int, timeout: float = 2.0):
+        """Thread testlerinde mock cagrisini kisa sure bekler."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if mock_function.call_count >= expected:
+                return True
+            time.sleep(0.01)
+        return False
 
     def test_1_invalid_intervals_rejected(self):
         """
@@ -109,6 +124,76 @@ class TestSyncManager(unittest.TestCase):
         )
         self.assertEqual(manager.cloud_interval, 120)
         self.assertEqual(manager.approval_interval, 45)
+
+    @patch("sync_manager.run_sync", return_value=(True, {}))
+    @patch("sync_manager.run_approval_sync", return_value=(True, {}))
+    def test_5_signal_wakes_cloud_worker_before_interval(self, mock_approval, mock_cloud):
+        manager = SyncManager(
+            cloud_interval=30,
+            approval_interval=30,
+            signal_path=self.signal_path,
+            signal_poll_interval=0.02,
+            signal_debounce=0.03,
+        )
+        manager.start()
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 1))
+
+        request_immediate_sync(self.signal_path)
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 2, timeout=1.0))
+        manager.stop()
+
+    @patch("sync_manager.run_sync", return_value=(True, {}))
+    @patch("sync_manager.run_approval_sync", return_value=(True, {}))
+    def test_6_periodic_sync_continues_without_signal(self, mock_approval, mock_cloud):
+        manager = SyncManager(
+            cloud_interval=0.15,
+            approval_interval=30,
+            signal_path=self.signal_path,
+            signal_poll_interval=0.02,
+        )
+        manager.start()
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 2, timeout=1.0))
+        manager.stop()
+
+    @patch("sync_manager.run_sync", return_value=(True, {}))
+    @patch("sync_manager.run_approval_sync", return_value=(True, {}))
+    def test_7_rapid_signals_are_coalesced_by_single_worker(self, mock_approval, mock_cloud):
+        manager = SyncManager(
+            cloud_interval=30,
+            approval_interval=30,
+            signal_path=self.signal_path,
+            signal_poll_interval=0.02,
+            signal_debounce=0.10,
+        )
+        manager.start()
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 1))
+
+        for _ in range(20):
+            request_immediate_sync(self.signal_path)
+
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 2, timeout=1.0))
+        time.sleep(0.20)
+        self.assertEqual(mock_cloud.call_count, 2)
+        manager.stop()
+
+    @patch("sync_manager.run_sync", side_effect=[Exception("HTTP offline"), (True, {})])
+    @patch("sync_manager.run_approval_sync", return_value=(True, {}))
+    def test_8_http_error_worker_survives_and_retries_on_signal(self, mock_approval, mock_cloud):
+        manager = SyncManager(
+            cloud_interval=30,
+            approval_interval=30,
+            signal_path=self.signal_path,
+            signal_poll_interval=0.02,
+            signal_debounce=0.03,
+        )
+        manager.start()
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 1))
+        self.assertTrue(manager.is_running())
+
+        request_immediate_sync(self.signal_path)
+        self.assertTrue(self.wait_for_call_count(mock_cloud, 2, timeout=1.0))
+        self.assertTrue(manager.is_running())
+        manager.stop()
 
 
 if __name__ == "__main__":

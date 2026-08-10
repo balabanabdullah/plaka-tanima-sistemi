@@ -8,6 +8,10 @@ echo.
 
 cd /d "%~dp0"
 
+if "%CAMERA_SOURCE%"=="" (
+    set "CAMERA_SOURCE=0"
+)
+
 if not exist "%~dp0.venv\Scripts\python.exe" (
     echo [ERROR] Python environment not found at .venv\Scripts\python.exe
     echo Please create the virtual environment before starting.
@@ -55,7 +59,8 @@ echo.
 timeout /t 1 /nobreak >nul
 
 echo [3/3] Starting OCR Reader in a new window...
-start "Plaka - OCR" cmd /k ""%~dp0.venv\Scripts\python.exe" "%~dp0src\ocr_reader.py" --camera 0 --direction auto --camera-name test_giris --barrier-dry-run"
+echo Camera source: %CAMERA_SOURCE%
+start "Plaka - OCR" cmd /k ""%~dp0.venv\Scripts\python.exe" "%~dp0src\ocr_reader.py" --camera %CAMERA_SOURCE% --direction auto --camera-name test_giris --barrier-dry-run"
 echo [OK] OCR Reader window launched.
 echo.
 

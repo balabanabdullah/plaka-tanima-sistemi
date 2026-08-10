@@ -45,3 +45,4 @@ models/*.weights
 .DS_Store
 Thumbs.db
 cloud-sql-proxy.exe
+data/.cloud_sync_wakeup

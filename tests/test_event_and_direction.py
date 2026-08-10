@@ -249,7 +249,11 @@ class TestEventAndDirection(unittest.TestCase):
     # ─────────────────────────────────────────────────────────────
 
     @patch("ocr_reader.get_session")
-    def test_process_plate_access_with_auto_direction(self, mock_get_session):
+    @patch("ocr_reader.request_immediate_sync")
+    @patch("cloud_sync.send_https_push")
+    def test_process_plate_access_with_auto_direction(
+        self, mock_https_push, mock_sync_signal, mock_get_session
+    ):
         """process_plate_access 'auto' parametresi aldığında DB'ye çözümlenmiş AccessDirection kaydetmelidir."""
         @contextmanager
         def mock_session():
@@ -274,6 +278,8 @@ class TestEventAndDirection(unittest.TestCase):
         self.assertEqual(decision1, "wait_for_approval")
         self.assertTrue(log1)
         self.assertEqual(resolved_dir1, AccessDirection.entry)
+        mock_sync_signal.assert_called_once_with()
+        mock_https_push.assert_not_called()
 
         # Veritabanında saklanan log yönünün string "auto" değil, "entry" olduğunu doğrula!
         with self.Session() as session:
@@ -507,6 +513,38 @@ class TestEventAndDirection(unittest.TestCase):
         # Artık yeni olay başladığı için ALLOW kararı bariyeri açmalıdır!
         self.assertEqual(sim.open_commands_sent, 1)
 
+    def test_regression_h_single_outlier_does_not_create_new_event(self):
+        """Aynı olay içindeki tek alakasız OCR sonucu yeni araç/log oluşturmamalıdır."""
+        sim = OCREventSimulator(self.Session, direction="auto")
+        t = 100.0
+        for plate in ["34AVEC01"] * 4 + ["18LD410"] + ["34AVEC01"] * 4:
+            sim.step_frame(t, plate_detected=True, ocr_text=plate)
+            t += 0.05
+
+        with self.Session() as session:
+            self.assertEqual(session.query(Vehicle).count(), 1)
+            self.assertEqual(session.query(AccessLog).count(), 1)
+            self.assertEqual(session.query(Vehicle).first().normalized_plate, "34AVEC01")
+
+    def test_regression_i_new_consistent_plate_after_event_reset(self):
+        """Yokluk resetinden sonra tutarlı farklı plaka yeni olay olmalıdır."""
+        sim = OCREventSimulator(self.Session, direction="auto")
+        t = 100.0
+        for _ in range(4):
+            sim.step_frame(t, plate_detected=True, ocr_text="34AVEC01")
+            t += 0.05
+
+        t += 4.0
+        for _ in range(4):
+            sim.step_frame(t, plate_detected=True, ocr_text="18LD410")
+            t += 0.05
+
+        with self.Session() as session:
+            self.assertEqual(session.query(Vehicle).count(), 2)
+            self.assertEqual(session.query(AccessLog).count(), 2)
+            plates = {v.normalized_plate for v in session.query(Vehicle).all()}
+            self.assertEqual(plates, {"34AVEC01", "18LD410"})
+
 
 class OCREventSimulator:
     """Birim testlerde fiziksel olay döngüsünü taklit eden test yardımcısı."""
@@ -571,7 +609,11 @@ class OCREventSimulator:
 
                 if is_probable_same_plate(final_metin, self.active_event_text):
                     if not self.active_event_processed:
-                        with patch("ocr_reader.get_session") as mock_get_session, patch("ocr_reader.should_log", return_value=True):
+                        with (
+                            patch("ocr_reader.get_session") as mock_get_session,
+                            patch("ocr_reader.should_log", return_value=True),
+                            patch("ocr_reader.request_immediate_sync"),
+                        ):
                             from contextlib import contextmanager
                             @contextmanager
                             def mock_sess():

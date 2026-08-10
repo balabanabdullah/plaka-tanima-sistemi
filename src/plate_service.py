@@ -112,13 +112,24 @@ def is_probable_same_plate(text_a: str, text_b: str) -> bool:
     if min_len >= 6 and (na in nb or nb in na):
         return True
 
-    dist = levenshtein_distance(na, nb)
-    max_len = max(len_a, len_b)
+    # Aynı uzunluktaki plakalarda genel Levenshtein eşleşmesi tehlikelidir.
+    # Örneğin 34ABC123 ve 34ABC128 iki gerçek farklı araç olabilir. Bu nedenle
+    # yalnızca ilk iki karakter gürültülüyken ve kalan uzun bölüm birebir aynıysa
+    # aynı fiziksel olay varyasyonu kabul edilir (örn. BLFRK052 / 34FRK052).
+    if len_a == len_b and len_a >= 7:
+        farkli_indeksler = [i for i, (a, b) in enumerate(zip(na, nb)) if a != b]
+        if farkli_indeksler and max(farkli_indeksler) < 2 and na[2:] == nb[2:]:
+            return levenshtein_distance(na, nb) <= 2
 
-    if max_len >= 7 and dist <= 2:
-        return True
-    if 5 <= max_len < 7 and dist <= 1:
-        return True
+    # Uzunluk farklıysa eksik/fazla okunmuş bir kenar karakteri olasılığı vardır.
+    # Aynı uzunluktaki gerçek plakalar bu kola giremez.
+    if len_a != len_b:
+        distance = levenshtein_distance(na, nb)
+        max_len = max(len_a, len_b)
+        if max_len >= 7 and distance <= 2:
+            return True
+        if 5 <= max_len < 7 and distance <= 1:
+            return True
 
     return False
 
@@ -621,4 +632,3 @@ def delete_vehicle(
 
     # Araç ana kaydını sil
     session.delete(arac)
-

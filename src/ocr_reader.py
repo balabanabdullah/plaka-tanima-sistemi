@@ -30,6 +30,7 @@ from plate_service import (
 from models import AccessDirection
 from sqlalchemy.exc import SQLAlchemyError
 from barrier_controller import BarrierController
+from sync_signal import request_immediate_sync
 
 # Proje kök dizini ve varsayılan model yolu
 # Path(__file__) -> bu dosyanın konumu (src/ocr_reader.py)
@@ -40,6 +41,9 @@ DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "license_plate_detector.pt"
 
 # OCR güven eşiği: bu değerin altındaki okumalar geçersiz sayılır
 OCR_CONFIDENCE_THRESHOLD = 0.45
+
+# Upscale OCR bu guven seviyesine ulastiysa ek CLAHE cagrisi yapilmaz.
+OCR_STRONG_CONFIDENCE = 0.85
 
 # OCR kaç karede bir çalışacak (CPU yükünü azaltmak için)
 OCR_FRAME_INTERVAL = 8
@@ -54,6 +58,10 @@ NEW_PLATE_CONFIRMATIONS = 3
 FINAL_HISTORY_SIZE = 8
 FINAL_MIN_MATCHES = 4
 FINAL_MIN_AVG_CONFIDENCE = 0.70
+
+# Dört okumadan üçünün aynı olması güçlü multi-frame kanıt kabul edilir.
+FINAL_DOMINANT_MIN_MATCHES = 3
+FINAL_DOMINANT_RATIO = 0.75
 
 # OCR için izin verilen karakter listesi (yalnızca Latin harf ve rakam)
 OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -173,6 +181,62 @@ def preprocess_plate(plate_crop: numpy.ndarray) -> numpy.ndarray:
     gray = clahe.apply(gray)
 
     return gray
+
+
+def create_ocr_preprocessing_variants(plate_crop: numpy.ndarray) -> list[numpy.ndarray]:
+    """En-boy oranını koruyan, CPU dostu OCR görüntü varyantları üretir."""
+    if plate_crop is None or plate_crop.size == 0:
+        return []
+
+    height, width = plate_crop.shape[:2]
+    # Gercek kamera testlerinde ozellikle 111x26 gibi kucuk crop'larda 3x
+    # buyutme okunabilirligi belirgin sekilde artirdi. En-boy orani korunur.
+    scale = 3
+    new_size = (width * scale, height * scale)
+    enlarged = cv2.resize(plate_crop, new_size, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Normal görüntü ve kontrastlı görüntü çoğu sahne için yeterlidir.
+    return [enlarged, enhanced]
+
+
+def read_plate_with_variants(
+    reader: "easyocr.Reader",
+    plate_crop: numpy.ndarray,
+) -> tuple[str, float]:
+    """3x upscale sonucunu onceler, gerekirse CLAHE ile tek aday secer."""
+    variants = create_ocr_preprocessing_variants(plate_crop)
+    if not variants:
+        return "OKUNAMADI", 0.0
+
+    # Birinci ve ana yol: aspect ratio korunmus 3x upscale.
+    upscale_result = read_plate_text(reader, variants[0])
+    upscale_text, upscale_confidence = upscale_result
+    if upscale_text != "OKUNAMADI" and upscale_confidence >= OCR_STRONG_CONFIDENCE:
+        return upscale_result
+
+    # Upscale zayif veya gecersizse ikinci ve son alternatif CLAHE'dir.
+    if len(variants) < 2:
+        return upscale_result
+
+    clahe_result = read_plate_text(reader, variants[1])
+    clahe_text, clahe_confidence = clahe_result
+
+    valid_results = [
+        result
+        for result in (upscale_result, clahe_result)
+        if result[0] != "OKUNAMADI"
+    ]
+    if not valid_results:
+        return "OKUNAMADI", 0.0
+
+    # Iki varyant ayni metni verdiginde yuksek confidence korunur. Farkli
+    # metinlerde frame ici en guvenli aday secilir; nihai karar yine mevcut
+    # multi-frame exact consensus tarafindan verilir.
+    return max(valid_results, key=lambda item: item[1])
 
 
 def read_plate_text(reader: "easyocr.Reader", plate_crop: numpy.ndarray) -> tuple[str, float]:
@@ -350,7 +414,7 @@ def process_plate_access(
     try:
         with get_session() as session:
             # Araç kaydını bul veya oluştur (UNIQUE korumalı)
-            vehicle, _ = get_or_create_vehicle(session, plate_text, normalized)
+            vehicle, vehicle_created = get_or_create_vehicle(session, plate_text, normalized)
 
             # Otomatik yön çözümlemesi ("auto" kipi veritabanı log geçmişine göre çözümlenir)
             if direction == "auto" or (isinstance(direction, str) and direction.lower() == "auto"):
@@ -389,7 +453,14 @@ def process_plate_access(
                         f"  Kamera: {source_camera}"
                     )
 
-            return normalized, vehicle.status.value, decision.value, log_created, resolved_direction
+            result = normalized, vehicle.status.value, decision.value, log_created, resolved_direction
+
+        # get_session() blogundan hatasiz cikildigi icin SQLite commit tamamlandi.
+        # Bu islem yalnizca yerel dosya sinyali uretir; HTTP istegi yapmaz.
+        if vehicle_created or log_created:
+            request_immediate_sync()
+
+        return result
 
     except SQLAlchemyError as e:
         print(f"Hata: Veritabanı işlemi sırasında sorun oluştu: {e}")
@@ -437,7 +508,7 @@ def get_final_plate_candidate(
     Adımlar:
     1. Geçmişteki exact metin tekrar sayıları hesaplanır (Counter).
     2. En sık geçen 1. ve 2. adaylar karşılaştırılır; eşitlik varsa None döner.
-    3. En sık adayın tekrar sayısı >= FINAL_MIN_MATCHES olmalı.
+    3. En sık aday 4 kez veya en az 3/4 baskınlıkla tekrar etmeli.
     4. Adayın ortalama güven değeri >= FINAL_MIN_AVG_CONFIDENCE (0.70) olmalı.
 
     Parametreler:
@@ -462,8 +533,15 @@ def get_final_plate_candidate(
     if len(most_common) > 1 and most_common[0][1] == most_common[1][1]:
         return None
 
-    # 2. Minimum tekrar kontrolü
-    if tekrar_sayisi < FINAL_MIN_MATCHES:
+    # 2. Minimum tekrar ve frame'ler arası baskınlık kontrolü.
+    # 3 doğru + 1 prefix/outlier gürültüsü güçlü kanıt kabul edilir. Gürültülü
+    # adayın karakterleri değiştirilmez; yalnızca baskın exact aday seçilir.
+    exact_yeterli = tekrar_sayisi >= FINAL_MIN_MATCHES
+    baskin_yeterli = (
+        tekrar_sayisi >= FINAL_DOMINANT_MIN_MATCHES
+        and tekrar_sayisi / len(history) >= FINAL_DOMINANT_RATIO
+    )
+    if not exact_yeterli and not baskin_yeterli:
         return None
 
     # 3. Ortalama güven hesaplama ve kontrolü
@@ -660,8 +738,7 @@ def run_plate_ocr(
                             print(f"[DEBUG OCR] Bulanık plaka atlandı: Sharpness={sharpness:.1f} (Min: {MIN_SHARPNESS})")
                         continue
 
-                    islenmis = preprocess_plate(plate_crop)
-                    okunan, guven = read_plate_text(ocr_reader, islenmis)
+                    okunan, guven = read_plate_with_variants(ocr_reader, plate_crop)
 
                     if DEBUG_OCR:
                         print(f"[DEBUG OCR] Boyut: {crop_w}x{crop_h} | Keskinlik: {sharpness:.1f} | OCR: '{okunan}' | Güven: {guven}")
