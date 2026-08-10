@@ -9,6 +9,7 @@
 <body>
 
     <!-- ── Üst Navbar ── -->
+    {% if authenticated %}
     <nav class="navbar">
         <div class="navbar-brand">
             <span class="brand-icon">🛡</span>
@@ -19,8 +20,13 @@
             <a href="/pending"     class="nav-link">Pending</a>
             <a href="/vehicles"    class="nav-link">Araçlar</a>
             <a href="/access-logs" class="nav-link">Erişim Kayıtları</a>
+            <form method="post" action="/logout" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn btn-delete">Çıkış</button>
+            </form>
         </div>
     </nav>
+    {% endif %}
 
     <!-- ── Ana İçerik ── -->
     <main class="container">

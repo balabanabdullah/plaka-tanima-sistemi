@@ -18,10 +18,11 @@ import uuid
 from typing import List, Optional, Any
 from pydantic import BaseModel, Field
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
 
 from database import init_db, get_session
 from models import AccessLog, Vehicle, VehicleStatus, AccessDirection, AccessDecision, utc_now
@@ -38,6 +39,81 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Geçerli status değerleri (filtre doğrulaması için)
 GECERLI_STATUSLAR = {"pending", "approved", "rejected", "inactive"}
+WEB_SESSION_MAX_AGE = 8 * 60 * 60
+
+
+class AppEnvSessionMiddleware(SessionMiddleware):
+    """APP_ENV production iken session cookie'sine Secure bayragi ekler."""
+
+    async def __call__(self, scope, receive, send):
+        self.security_flags = "httponly; samesite=lax"
+        if os.environ.get("APP_ENV", "development").strip().lower() == "production":
+            self.security_flags += "; secure"
+        await super().__call__(scope, receive, send)
+
+
+def get_web_auth_config() -> tuple[str, str, str]:
+    """Web auth ayarlarini ortamdan okur; degerleri loglamaz."""
+    return (
+        os.environ.get("WEB_ADMIN_USERNAME", "").strip(),
+        os.environ.get("WEB_ADMIN_PASSWORD", ""),
+        os.environ.get("WEB_SESSION_SECRET", "").strip(),
+    )
+
+
+def ensure_web_auth_configured() -> tuple[str, str, str]:
+    """Eksik auth ayarinda paneli fail-closed tutar."""
+    username, password, session_secret = get_web_auth_config()
+    if not username or not password or not session_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Web panel authentication is not configured.",
+        )
+    return username, password, session_secret
+
+
+def get_or_create_csrf_token(request: Request) -> str:
+    """Session icinde tahmin edilemez CSRF token olusturur veya mevcut olani doner."""
+    token = request.session.get("csrf_token")
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
+
+
+def verify_csrf_token(request: Request, provided_token: str) -> None:
+    """CSRF token'i constant-time karsilastirma ile dogrular."""
+    expected_token = request.session.get("csrf_token", "")
+    if (
+        not isinstance(expected_token, str)
+        or not expected_token
+        or not provided_token
+        or not secrets.compare_digest(provided_token, expected_token)
+    ):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
+
+
+def require_web_auth(request: Request) -> str:
+    """Panel route'lari icin config ve authenticated session kontrolu."""
+    username, _, _ = ensure_web_auth_configured()
+    if request.session.get("authenticated") is not True:
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
+    session_username = request.session.get("username", "")
+    if not isinstance(session_username, str) or not secrets.compare_digest(session_username, username):
+        request.session.clear()
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
+    return session_username
+
+
+def web_template_context(request: Request, **values) -> dict:
+    """Tum panel template'leri icin auth ve CSRF context'i hazirlar."""
+    context = {
+        "authenticated": request.session.get("authenticated") is True,
+        "current_username": request.session.get("username"),
+        "csrf_token": get_or_create_csrf_token(request),
+    }
+    context.update(values)
+    return context
 
 
 # ─────────────────────────────────────────────
@@ -135,6 +211,21 @@ app = FastAPI(
     title="Plaka Tanıma Güvenlik Paneli",
     description="Yerel plaka yetkilendirme ve takip sistemi.",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+# Secret eksikse random process anahtari middleware'in calismasini saglar;
+# ensure_web_auth_configured() panel loginini yine 503 ile fail-closed tutar.
+_configured_session_secret = os.environ.get("WEB_SESSION_SECRET", "").strip()
+app.add_middleware(
+    AppEnvSessionMiddleware,
+    secret_key=_configured_session_secret or secrets.token_urlsafe(32),
+    session_cookie="plate_admin_session",
+    max_age=WEB_SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=False,
 )
 
 # Statik dosyalar (CSS)
@@ -160,12 +251,68 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    """Yonetici login formunu gosterir."""
+    ensure_web_auth_configured()
+    if request.session.get("authenticated") is True:
+        return RedirectResponse("/", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context=web_template_context(request, error=None),
+    )
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    csrf_token: str = Form(default=""),
+):
+    """Yonetici bilgilerini dogrular ve authenticated session olusturur."""
+    expected_username, expected_password, _ = ensure_web_auth_configured()
+    verify_csrf_token(request, csrf_token)
+
+    username_ok = secrets.compare_digest(username, expected_username)
+    password_ok = secrets.compare_digest(password, expected_password)
+    if not (username_ok and password_ok):
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context=web_template_context(
+                request,
+                error="Kullanıcı adı veya parola hatalı",
+            ),
+            status_code=401,
+        )
+
+    request.session.clear()
+    request.session["authenticated"] = True
+    request.session["username"] = expected_username
+    request.session["csrf_token"] = secrets.token_urlsafe(32)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/logout")
+async def logout_submit(
+    request: Request,
+    csrf_token: str = Form(default=""),
+    _username: str = Depends(require_web_auth),
+):
+    """CSRF dogrulamasi sonrasinda authenticated session'i temizler."""
+    verify_csrf_token(request, csrf_token)
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
 # ─────────────────────────────────────────────
 # GET /   — Dashboard
 # ─────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request, _username: str = Depends(require_web_auth)):
     """
     Ana sayfa: durum sayaçları, pending araçlar ve son erişim kayıtları.
     """
@@ -210,11 +357,12 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context={
-            "stats":            stats,
-            "pending_vehicles": pending_vehicles,
-            "recent_logs":      recent_logs,
-        },
+        context=web_template_context(
+            request,
+            stats=stats,
+            pending_vehicles=pending_vehicles,
+            recent_logs=recent_logs,
+        ),
     )
 
 
@@ -223,7 +371,7 @@ async def dashboard(request: Request):
 # ─────────────────────────────────────────────
 
 @app.get("/pending", response_class=HTMLResponse)
-async def pending_list(request: Request):
+async def pending_list(request: Request, _username: str = Depends(require_web_auth)):
     """
     Onay bekleyen tüm araçları Approve / Reject butonlarıyla listeler.
     """
@@ -243,12 +391,13 @@ async def pending_list(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="vehicles.html",
-        context={
-            "vehicles":       vehicles,
-            "current_status": "pending",
-            "pending_mode":   True,
-            "title":          "Onay Bekleyen Araçlar",
-        },
+        context=web_template_context(
+            request,
+            vehicles=vehicles,
+            current_status="pending",
+            pending_mode=True,
+            title="Onay Bekleyen Araçlar",
+        ),
     )
 
 
@@ -257,7 +406,11 @@ async def pending_list(request: Request):
 # ─────────────────────────────────────────────
 
 @app.get("/vehicles", response_class=HTMLResponse)
-async def vehicles_list(request: Request, status: str | None = None):
+async def vehicles_list(
+    request: Request,
+    status: str | None = None,
+    _username: str = Depends(require_web_auth),
+):
     """
     Tüm araçları listeler. Opsiyonel ?status=pending/approved/rejected/inactive filtresi.
     """
@@ -281,12 +434,13 @@ async def vehicles_list(request: Request, status: str | None = None):
     return templates.TemplateResponse(
         request=request,
         name="vehicles.html",
-        context={
-            "vehicles":       vehicles,
-            "current_status": status or "",
-            "pending_mode":   False,
-            "title":          "Araç Listesi",
-        },
+        context=web_template_context(
+            request,
+            vehicles=vehicles,
+            current_status=status or "",
+            pending_mode=False,
+            title="Araç Listesi",
+        ),
     )
 
 
@@ -295,7 +449,7 @@ async def vehicles_list(request: Request, status: str | None = None):
 # ─────────────────────────────────────────────
 
 @app.get("/access-logs", response_class=HTMLResponse)
-async def access_logs_list(request: Request):
+async def access_logs_list(request: Request, _username: str = Depends(require_web_auth)):
     """
     Son 100 erişim kaydını en yeni önce gösterir.
     """
@@ -311,9 +465,7 @@ async def access_logs_list(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="access_logs.html",
-        context={
-            "logs": logs,
-        },
+        context=web_template_context(request, logs=logs),
     )
 
 
@@ -322,10 +474,16 @@ async def access_logs_list(request: Request):
 # ─────────────────────────────────────────────
 
 @app.post("/vehicles/{vehicle_id}/approve")
-async def approve_endpoint(vehicle_id: int):
+async def approve_endpoint(
+    vehicle_id: int,
+    request: Request,
+    csrf_token: str = Form(default=""),
+    _username: str = Depends(require_web_auth),
+):
     """
     Aracı onaylar (status=approved). Sonrası /pending sayfasına yönlendirir.
     """
+    verify_csrf_token(request, csrf_token)
     try:
         with get_session() as session:
             vehicle = session.query(Vehicle).filter_by(id=vehicle_id).first()
@@ -348,10 +506,17 @@ async def approve_endpoint(vehicle_id: int):
 # ─────────────────────────────────────────────
 
 @app.post("/vehicles/{vehicle_id}/reject")
-async def reject_endpoint(vehicle_id: int, reason: str = Form(default="")):
+async def reject_endpoint(
+    vehicle_id: int,
+    request: Request,
+    reason: str = Form(default=""),
+    csrf_token: str = Form(default=""),
+    _username: str = Depends(require_web_auth),
+):
     """
     Aracı reddeder (status=rejected). Sonrası /pending sayfasına yönlendirir.
     """
+    verify_csrf_token(request, csrf_token)
     try:
         with get_session() as session:
             vehicle = session.query(Vehicle).filter_by(id=vehicle_id).first()
@@ -374,11 +539,17 @@ async def reject_endpoint(vehicle_id: int, reason: str = Form(default="")):
 # ─────────────────────────────────────────────
 
 @app.post("/vehicles/{vehicle_id}/delete")
-async def delete_endpoint(vehicle_id: int):
+async def delete_endpoint(
+    vehicle_id: int,
+    request: Request,
+    csrf_token: str = Form(default=""),
+    _username: str = Depends(require_web_auth),
+):
     """
     Aracı veritabanından kalıcı olarak siler (geçmiş loglar saklanır).
     Sonrasında /vehicles sayfasına yönlendirir.
     """
+    verify_csrf_token(request, csrf_token)
     try:
         with get_session() as session:
             vehicle = session.query(Vehicle).filter_by(id=vehicle_id).first()
@@ -668,4 +839,3 @@ async def sync_approvals_endpoint(payload: ApprovalsSyncRequest, request: Reques
                 "notes": v.notes,
             })
         return results
-
